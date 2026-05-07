@@ -9,7 +9,7 @@ const META_ACCOUNT_ID = process.env.META_ACCOUNT_ID;
 const PORT = process.env.PORT || 3000;
 const BASE = "https://graph.facebook.com/v19.0";
 
-// ── Meta API helper ───────────────────────────────────────────────────────────
+// ── Meta API helpers ─────────────────────────────────────────────────────────
 async function metaGet(path, params = {}) {
   const qs = new URLSearchParams({ access_token: META_TOKEN, ...params });
   const r = await fetch(`${BASE}${path}?${qs}`);
@@ -39,18 +39,18 @@ function dateRange(days) {
   };
 }
 
-// ===================== FIXED SSE MCP SECTION =====================
+// ===================== SERVER SETUP =====================
 function createServer() {
   const server = new McpServer({
     name: "fb-ads-mcp",
     version: "1.0.0",
   });
-
   registerTools(server);
   return server;
 }
 
 function registerTools(server) {
+
   // ── TOOL: get_campaigns ───────────────────────────────────────────────────────
   server.tool(
     "get_campaigns",
@@ -85,28 +85,26 @@ function registerTools(server) {
         };
       });
 
-      const totalSpend = campaigns.reduce((s, c) => s + parseFloat(c.spend.replace("$", "")), 0);
+      const totalSpend = campaigns.reduce((s, c) => s + parseFloat(c.spend.replace("$", "") || 0), 0);
       const totalPurchases = campaigns.reduce((s, c) => s + parseInt(c.purchases), 0);
       const active = campaigns.filter((c) => c.status === "ACTIVE").length;
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              period: `${days} дней (${dateRange(days).since} — ${dateRange(days).until})`,
-              summary: {
-                total_campaigns: campaigns.length,
-                active: active,
-                paused: campaigns.length - active,
-                total_spend: `$${totalSpend.toFixed(2)}`,
-                total_purchases: totalPurchases,
-                avg_cpp: totalPurchases > 0 ? `$${(totalSpend / totalPurchases).toFixed(2)}` : "нет конверсий",
-              },
-              campaigns,
-            }, null, 2),
-          },
-        ],
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            period: `${days} дней`,
+            summary: {
+              total_campaigns: campaigns.length,
+              active,
+              paused: campaigns.length - active,
+              total_spend: `$${totalSpend.toFixed(2)}`,
+              total_purchases: totalPurchases,
+              avg_cpp: totalPurchases > 0 ? `$${(totalSpend / totalPurchases).toFixed(2)}` : "нет конверсий",
+            },
+            campaigns,
+          }, null, 2)
+        }]
       };
     }
   );
@@ -117,7 +115,7 @@ function registerTools(server) {
     "Получить адсеты конкретной кампании",
     {
       campaign_id: z.string().describe("ID кампании"),
-      days: z.number().optional().default(7).describe("Период в днях"),
+      days: z.number().optional().default(7),
     },
     async ({ campaign_id, days }) => {
       const { since, until } = dateRange(days);
@@ -142,7 +140,7 @@ function registerTools(server) {
       });
 
       return {
-        content: [{ type: "text", text: JSON.stringify({ campaign_id, adsets }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ campaign_id, adsets }, null, 2) }]
       };
     }
   );
@@ -157,7 +155,6 @@ function registerTools(server) {
       days: z.number().optional().default(7),
     },
     async ({ adset_id, campaign_id, days }) => {
-      const parentId = adset_id || campaign_id;
       const endpoint = adset_id ? `/${adset_id}/ads` : `/${campaign_id}/ads`;
       const { since, until } = dateRange(days);
       const d = await metaGet(endpoint, {
@@ -180,7 +177,7 @@ function registerTools(server) {
       });
 
       return {
-        content: [{ type: "text", text: JSON.stringify({ ads }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ ads }, null, 2) }]
       };
     }
   );
@@ -196,10 +193,7 @@ function registerTools(server) {
     async ({ campaign_id, status }) => {
       const d = await metaPost(`/${campaign_id}`, { status });
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ success: true, campaign_id, new_status: status, result: d }),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, campaign_id, new_status: status, result: d }) }]
       };
     }
   );
@@ -215,10 +209,7 @@ function registerTools(server) {
     async ({ adset_id, status }) => {
       const d = await metaPost(`/${adset_id}`, { status });
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ success: true, adset_id, new_status: status, result: d }),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, adset_id, new_status: status, result: d }) }]
       };
     }
   );
@@ -232,13 +223,10 @@ function registerTools(server) {
       daily_budget_usd: z.number().describe("Новый дневной бюджет в USD"),
     },
     async ({ object_id, daily_budget_usd }) => {
-      const daily_budget = Math.round(daily_budget_usd * 100); // cents
+      const daily_budget = Math.round(daily_budget_usd * 100);
       const d = await metaPost(`/${object_id}`, { daily_budget });
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ success: true, object_id, new_budget: `$${daily_budget_usd}`, result: d }),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, object_id, new_budget: `$${daily_budget_usd}`, result: d }) }]
       };
     }
   );
@@ -249,17 +237,14 @@ function registerTools(server) {
     "Дублировать адсет (для масштабирования)",
     {
       adset_id: z.string().describe("ID адсета для дублирования"),
-      new_budget_usd: z.number().optional().describe("Новый бюджет в USD (если не указан — как у оригинала)"),
+      new_budget_usd: z.number().optional().describe("Новый бюджет в USD"),
     },
     async ({ adset_id, new_budget_usd }) => {
       const body = { deep_copy: true };
       if (new_budget_usd) body.daily_budget = Math.round(new_budget_usd * 100);
       const d = await metaPost(`/${adset_id}/copies`, body);
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ success: true, original_adset_id: adset_id, new_adset: d }),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ success: true, original_adset_id: adset_id, new_adset: d }) }]
       };
     }
   );
@@ -269,13 +254,13 @@ function registerTools(server) {
     "check_limits",
     "Проверить все кампании на нарушение лимитов и при необходимости паузнуть",
     {
-      max_cpp: z.number().optional().default(20).describe("Макс. цена покупки $"),
-      max_spend_no_conv: z.number().optional().default(10).describe("Макс. спенд без конверсий $"),
-      min_ctr: z.number().optional().default(0.5).describe("Мин. CTR %"),
-      auto_pause: z.boolean().optional().default(false).describe("Автоматически паузить нарушителей"),
+      max_cpp: z.number().optional().default(20),
+      max_spend_no_conv: z.number().optional().default(10),
+      min_ctr: z.number().optional().default(0.5),
+      auto_pause: z.boolean().optional().default(false),
     },
     async ({ max_cpp, max_spend_no_conv, min_ctr, auto_pause }) => {
-      const { since, until } = dateRange(1); // за сегодня
+      const { since, until } = dateRange(1);
       const d = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, {
         fields: `id,name,status,insights.time_range({"since":"${since}","until":"${until}"}){spend,ctr,actions}`,
         limit: 50,
@@ -293,12 +278,9 @@ function registerTools(server) {
         const cpp = purchases > 0 ? spend / purchases : null;
 
         const issues = [];
-        if (spend >= max_spend_no_conv && purchases === 0)
-          issues.push(`Спенд $${spend.toFixed(2)} без конверсий (лимит $${max_spend_no_conv})`);
-        if (cpp && cpp > max_cpp)
-          issues.push(`CPP $${cpp.toFixed(2)} > лимита $${max_cpp}`);
-        if (spend > 2 && ctr < min_ctr)
-          issues.push(`CTR ${ctr.toFixed(2)}% < мин ${min_ctr}%`);
+        if (spend >= max_spend_no_conv && purchases === 0) issues.push(`Спенд $${spend.toFixed(2)} без конверсий`);
+        if (cpp && cpp > max_cpp) issues.push(`CPP $${cpp.toFixed(2)} > ${max_cpp}`);
+        if (spend > 2 && ctr < min_ctr) issues.push(`CTR ${ctr.toFixed(2)}% < ${min_ctr}%`);
 
         if (issues.length) {
           violations.push({ id: c.id, name: c.name, issues });
@@ -310,15 +292,7 @@ function registerTools(server) {
       }
 
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            checked_at: new Date().toISOString(),
-            violations_found: violations.length,
-            violations,
-            auto_paused: paused,
-          }, null, 2),
-        }],
+        content: [{ type: "text", text: JSON.stringify({ violations_found: violations.length, violations, auto_paused: paused }, null, 2) }]
       };
     }
   );
@@ -327,9 +301,7 @@ function registerTools(server) {
   server.tool(
     "get_account_summary",
     "Общая сводка по рекламному аккаунту за период",
-    {
-      days: z.number().optional().default(7),
-    },
+    { days: z.number().optional().default(7) },
     async ({ days }) => {
       const { since, until } = dateRange(days);
       const d = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
@@ -350,49 +322,55 @@ function registerTools(server) {
             impressions: ins.impressions || 0,
             clicks: ins.clicks || 0,
             ctr: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
-            cpc: ins.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null,
             purchases,
             cpp: purchases > 0 ? `$${(parseFloat(ins.spend) / purchases).toFixed(2)}` : "нет конверсий",
-          }, null, 2),
-        }],
+          }, null, 2)
+        }]
       };
     }
   );
 }
 
-// ── Express + SSE transport ───────────────────────────────────────────────────
+// ===================== EXPRESS + SSE (оптимизировано под Railway + Claude) =====================
 const app = express();
 const transports = {};
 
+app.use(express.json());
+
 app.get("/sse", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
 
-  const server = createServer();
+  const mcpServer = createServer();
 
   res.on("close", async () => {
     delete transports[transport.sessionId];
-    try {
-      await server.close();
-    } catch (e) {
-      console.error("Close error:", e.message);
-    }
+    try { await mcpServer.close(); } catch (_) {}
   });
 
   try {
-    await server.connect(transport);
+    await mcpServer.connect(transport);
+    console.log(`✅ Новый клиент MCP подключился: ${transport.sessionId}`);
   } catch (e) {
-    console.error("MCP connection error:", e);
+    console.error("❌ MCP connect error:", e);
     res.end();
   }
 });
 
-app.post("/messages", express.json(), async (req, res) => {
+app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
+
   if (!transport) {
     return res.status(404).json({ error: "Session not found" });
   }
+
   try {
     await transport.handlePostMessage(req, res);
   } catch (e) {
@@ -407,6 +385,5 @@ app.get("/health", (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✅ FB Ads MCP server running on port ${PORT}`);
-  console.log(`   Account: act_${META_ACCOUNT_ID}`);
-  console.log(`   SSE endpoint: http://localhost:${PORT}/sse`);
+  console.log(`🔗 https://fb-ads-mcp-3kj3-production-18b6.up.railway.app`);
 });
