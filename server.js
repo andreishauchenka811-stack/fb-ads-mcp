@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import fetch from "node-fetch";
+import { Netmask } from "netmask";
 import { z } from "zod";
 
 const META_TOKEN = process.env.META_TOKEN;
@@ -357,14 +358,41 @@ server.tool(
 const app = express();
 const transports = {};
 
-app.get("/sse", async (req, res) => {
+// ── IP allowlist middleware ───────────────────────────────────────────────────
+// Permits Anthropic's outbound IP range (160.79.104.0/21) and localhost.
+const ALLOWED_RANGES = [
+  new Netmask("160.79.104.0/21"), // Anthropic outbound IPs
+];
+const LOCALHOST_IPS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+function ipAllowlist(req, res, next) {
+  // Express sets req.ip; honour X-Forwarded-For when behind a proxy.
+  const raw = req.ip || req.socket.remoteAddress || "";
+  // Strip IPv6-mapped IPv4 prefix so Netmask can parse it.
+  const ip = raw.startsWith("::ffff:") ? raw.slice(7) : raw;
+
+  if (LOCALHOST_IPS.has(raw) || LOCALHOST_IPS.has(ip)) {
+    return next();
+  }
+
+  for (const block of ALLOWED_RANGES) {
+    if (block.contains(ip)) {
+      return next();
+    }
+  }
+
+  console.warn(`[allowlist] Blocked request from ${ip}`);
+  return res.status(403).json({ error: "Host not in allowlist" });
+}
+
+app.get("/sse", ipAllowlist, async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
   res.on("close", () => delete transports[transport.sessionId]);
   await server.connect(transport);
 });
 
-app.post("/messages", express.json(), async (req, res) => {
+app.post("/messages", ipAllowlist, express.json(), async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
   if (!transport) return res.status(404).json({ error: "Session not found" });
