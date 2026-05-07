@@ -29,16 +29,30 @@ async function metaPost(path, body = {}) {
   return d;
 }
 
+function fmtDate(d) {
+  return d.toISOString().split("T")[0];
+}
+
+// days=1 = только сегодня, days=7 = последние 7 дней включая сегодня
 function dateRange(days) {
-  const end = new Date();
-  const start = new Date(end);
-  start.setDate(end.getDate() - days);
-  return {
-    time_range: JSON.stringify({
-      since: start.toISOString().split("T")[0],
-      until: end.toISOString().split("T")[0],
-    }),
-  };
+  const until = new Date();
+  const since = new Date(until);
+  since.setDate(until.getDate() - (days - 1));
+  return { time_range: JSON.stringify({ since: fmtDate(since), until: fmtDate(until) }) };
+}
+
+// Явно сегодня
+function todayRange() {
+  const t = fmtDate(new Date());
+  return { time_range: JSON.stringify({ since: t, until: t }) };
+}
+
+// Явно вчера
+function yesterdayRange() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  const y = fmtDate(d);
+  return { time_range: JSON.stringify({ since: y, until: y }) };
 }
 
 const INSIGHTS_FIELDS = [
@@ -66,32 +80,64 @@ function registerTools(s) {
 
   s.tool(
     "get_account_overview",
-    "Общая сводка по рекламному кабинету",
-    { days: z.number().min(1).max(90).default(14) },
-    async ({ days }) => {
-      const data = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
-        fields: INSIGHTS_FIELDS,
-        level: "account",
-        ...dateRange(days),
-      });
-      const ins = data.data?.[0] || {};
+    "Общая сводка по рекламному кабинету. date_preset: today, yesterday, last_7d, last_14d, last_30d",
+    {
+      days: z.number().min(1).max(90).default(14),
+      date_preset: z.enum(["today", "yesterday", "last_7d", "last_14d", "last_30d", "custom"]).default("custom"),
+    },
+    async ({ days, date_preset }) => {
+      const range = date_preset === "today" ? todayRange()
+        : date_preset === "yesterday" ? yesterdayRange()
+        : date_preset === "last_7d" ? dateRange(7)
+        : date_preset === "last_14d" ? dateRange(14)
+        : date_preset === "last_30d" ? dateRange(30)
+        : dateRange(days);
+
+      const label = date_preset !== "custom" ? date_preset : `${days} дней`;
+
+      // Тянем сегодня и вчера параллельно для сравнения
+      const [dataMain, dataToday, dataYest] = await Promise.all([
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...range }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...todayRange() }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...yesterdayRange() }),
+      ]);
+
+      const ins = dataMain.data?.[0] || {};
+      const insToday = dataToday.data?.[0] || {};
+      const insYest = dataYest.data?.[0] || {};
       const { purchases, cpp, revenue, roas } = parsePurchases(ins);
+      const todayParsed = parsePurchases(insToday);
+      const yesterdayParsed = parsePurchases(insYest);
+
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
-            период_дней: days,
-            спенд: `$${parseFloat(ins.spend || 0).toFixed(2)}`,
-            показы: ins.impressions || 0,
-            охват: ins.reach || 0,
-            клики: ins.clicks || 0,
-            ctr: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
-            cpc: ins.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null,
-            cpm: ins.cpm ? `$${parseFloat(ins.cpm).toFixed(2)}` : null,
-            покупки: purchases,
-            cpp: cpp ? `$${cpp}` : "нет конверсий",
-            выручка: `$${revenue}`,
-            roas: roas ? `${roas}x` : null,
+            период: label,
+            итого: {
+              спенд: `$${parseFloat(ins.spend || 0).toFixed(2)}`,
+              показы: ins.impressions || 0,
+              клики: ins.clicks || 0,
+              ctr: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
+              cpc: ins.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null,
+              cpm: ins.cpm ? `$${parseFloat(ins.cpm).toFixed(2)}` : null,
+              покупки: purchases,
+              cpp: cpp ? `$${cpp}` : "нет конверсий",
+              выручка: `$${revenue}`,
+              roas: roas ? `${roas}x` : null,
+            },
+            сегодня: {
+              спенд: `$${parseFloat(insToday.spend || 0).toFixed(2)}`,
+              покупки: todayParsed.purchases,
+              cpp: todayParsed.cpp ? `$${todayParsed.cpp}` : "нет конверсий",
+              roas: todayParsed.roas ? `${todayParsed.roas}x` : null,
+            },
+            вчера: {
+              спенд: `$${parseFloat(insYest.spend || 0).toFixed(2)}`,
+              покупки: yesterdayParsed.purchases,
+              cpp: yesterdayParsed.cpp ? `$${yesterdayParsed.cpp}` : "нет конверсий",
+              roas: yesterdayParsed.roas ? `${yesterdayParsed.roas}x` : null,
+            },
           }, null, 2),
         }],
       };
