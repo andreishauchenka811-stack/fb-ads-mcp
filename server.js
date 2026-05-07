@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import cors from "cors";
 import express from "express";
 import fetch from "node-fetch";
 import { z } from "zod";
@@ -355,6 +356,7 @@ server.tool(
 
 // ── Express + SSE transport ───────────────────────────────────────────────────
 const app = express();
+app.use(cors());
 const transports = {};
 
 app.get("/sse", async (req, res) => {
