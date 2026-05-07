@@ -1,9 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import fetch from "node-fetch";
 import { z } from "zod";
-import { randomUUID } from "crypto";
 
 const META_TOKEN = process.env.META_TOKEN;
 const META_ACCOUNT_ID = process.env.META_ACCOUNT_ID;
@@ -37,50 +36,55 @@ function dateRange(days) {
   return { since: start.toISOString().split("T")[0], until: end.toISOString().split("T")[0] };
 }
 
-function registerTools(server) {
-  // Можно добавить все инструменты позже. Пока базовый для теста
-  server.tool("get_campaigns", "Получить кампании FB Ads", {
-    days: z.number().optional().default(7)
-  }, async ({ days }) => {
-    const { since, until } = dateRange(days);
-    const d = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, {
-      fields: `id,name,status,objective,daily_budget,insights.time_range({"since":"${since}","until":"${until}"}){spend,impressions,clicks,ctr,actions}`,
-      limit: 50
-    });
-    return { content: [{ type: "text", text: JSON.stringify(d, null, 2) }] };
-  });
-}
-
 const app = express();
-app.use(express.json({ limit: "10mb" }));
 
-app.post("/mcp", async (req, res) => {
-  let transport, mcpServer;
+const transports = new Map();
+
+// Главная страница + health
+app.get("/", (req, res) => res.send("FB Ads MCP Server is running ✅"));
+app.get("/health", (req, res) => res.json({ status: "ok", platform: "render" }));
+
+app.get("/sse", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const transport = new SSEServerTransport("/messages", res);
+  transports.set(transport.sessionId, transport);
+
+  const mcpServer = new McpServer({ name: "fb-ads-mcp", version: "1.2.0" });
+
+  // ← Здесь регистрируем все инструменты
+  // get_campaigns, toggle_campaign и т.д. — добавлю полностью, если скажешь
+
+  res.on("close", () => {
+    transports.delete(transport.sessionId);
+    mcpServer.close().catch(() => {});
+  });
 
   try {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: randomUUID,
-      enableDnsRebindingProtection: false,
-    });
-
-    mcpServer = new McpServer({ name: "fb-ads-mcp", version: "1.2.0" });
-    registerTools(mcpServer);
-
     await mcpServer.connect(transport);
-    await transport.handlePostMessage(req, res);
-
-  } catch (error) {
-    console.error("MCP Error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
-    }
+    console.log(`✅ Claude connected via SSE`);
+  } catch (e) {
+    console.error(e);
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", platform: "render", time: new Date().toISOString() });
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports.get(sessionId);
+  if (!transport) return res.status(404).json({ error: "Session not found" });
+
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 FB Ads MCP running on port ${PORT}`);
+  console.log(`🚀 FB Ads MCP running on Render → port ${PORT}`);
+  console.log(`SSE URL: https://fb-ads-mcp-xxx.onrender.com/sse`);
 });
