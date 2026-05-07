@@ -400,7 +400,15 @@ app.get("/sse", async (req, res) => {
   );
 
   // ── Connect ──────────────────────────────────────────────────────────────────
+  // Keepalive — Render обрывает SSE через ~55 сек тишины
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(": ping\n\n");
+    }
+  }, 30000);
+
   res.on("close", () => {
+    clearInterval(keepalive);
     transports.delete(transport.sessionId);
     mcpServer.close().catch(() => {});
   });
