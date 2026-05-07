@@ -375,6 +375,19 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", account: META_ACCOUNT_ID ? "connected" : "no token" });
 });
 
+app.get("/", (req, res) => {
+  res.json({
+    service: "fb-ads-mcp",
+    version: "1.0.0",
+    status: "running",
+    endpoints: {
+      sse: "/sse",
+      messages: "/messages",
+      health: "/health",
+    },
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`✅ FB Ads MCP server running on port ${PORT}`);
   console.log(`   Account: act_${META_ACCOUNT_ID}`);
