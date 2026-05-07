@@ -59,6 +59,7 @@ const INSIGHTS_FIELDS = [
   "spend", "impressions", "reach", "clicks",
   "ctr", "cpc", "cpm", "frequency",
   "actions", "cost_per_action_type", "action_values",
+  "action_attribution_windows",
 ].join(",");
 
 function parsePurchases(ins) {
@@ -75,7 +76,7 @@ function parsePurchases(ins) {
 function registerTools(s) {
 
   s.tool("hello", "Проверка связи с сервером", {}, async () => ({
-    content: [{ type: "text", text: "✅ FB Ads MCP v2.1.0 подключён!" }],
+    content: [{ type: "text", text: "✅ FB Ads MCP v3.0.0 подключён!" }],
   }));
 
   s.tool(
@@ -806,6 +807,327 @@ function registerTools(s) {
     }
   );
 
+
+  // ── create_campaign ────────────────────────────────────────────────────────
+  s.tool(
+    "create_campaign",
+    "Создать кампанию с нуля",
+    {
+      name: z.string().describe("Название кампании"),
+      objective: z.enum(["OUTCOME_SALES", "OUTCOME_LEADS", "OUTCOME_TRAFFIC", "OUTCOME_AWARENESS", "OUTCOME_ENGAGEMENT"]).default("OUTCOME_SALES"),
+      daily_budget_usd: z.number().optional().describe("Дневной бюджет в USD (если задаётся на уровне кампании)"),
+      status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
+      special_ad_categories: z.array(z.string()).default([]),
+    },
+    async ({ name, objective, daily_budget_usd, status, special_ad_categories }) => {
+      const body = {
+        name,
+        objective,
+        status,
+        special_ad_categories,
+      };
+      if (daily_budget_usd) body.daily_budget = Math.round(daily_budget_usd * 100);
+      const d = await metaPost(`/act_${META_ACCOUNT_ID}/campaigns`, body);
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, campaign_id: d.id, name, objective, status }, null, 2) }] };
+    }
+  );
+
+  // ── create_adset ───────────────────────────────────────────────────────────
+  s.tool(
+    "create_adset",
+    "Создать новый адсет с полными настройками таргетинга",
+    {
+      name: z.string(),
+      campaign_id: z.string(),
+      daily_budget_usd: z.number().describe("Дневной бюджет в USD"),
+      optimization_goal: z.enum(["OFFSITE_CONVERSIONS", "LINK_CLICKS", "REACH", "IMPRESSIONS", "LEAD_GENERATION"]).default("OFFSITE_CONVERSIONS"),
+      billing_event: z.enum(["IMPRESSIONS", "LINK_CLICKS"]).default("IMPRESSIONS"),
+      pixel_id: z.string().optional().describe("ID пикселя (если не указан — берётся из ENV)"),
+      countries: z.array(z.string()).default(["UA"]).describe("Гео: ['UA'], ['US','CA'], ['WORLDWIDE'] для широкой"),
+      languages: z.array(z.number()).default([]).describe("Языки: 32=украинский, 8=русский, 6=английский"),
+      age_min: z.number().default(18),
+      age_max: z.number().default(65),
+      genders: z.array(z.number()).default([]).describe("1=мужской, 2=женский, [] = все"),
+      excluded_connections: z.array(z.string()).default([]).describe("Исключить: page_id тех кто уже лайкнул страницу"),
+      status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
+      start_time: z.string().optional().describe("ISO дата старта, например 2025-01-15T11:00:00+0200"),
+      end_time: z.string().optional(),
+    },
+    async ({ name, campaign_id, daily_budget_usd, optimization_goal, billing_event, pixel_id, countries, languages, age_min, age_max, genders, excluded_connections, status, start_time, end_time }) => {
+      const targeting = {
+        age_min,
+        age_max,
+        geo_locations: countries.includes("WORLDWIDE")
+          ? { location_types: ["home", "recent"] }
+          : { countries },
+      };
+      if (languages.length) targeting.locales = languages;
+      if (genders.length) targeting.genders = genders;
+      if (excluded_connections.length) {
+        targeting.excluded_connections = excluded_connections.map((id) => ({ id, type: "page" }));
+      }
+
+      const usedPixel = pixel_id || process.env.META_PIXEL_ID;
+      const body = {
+        name,
+        campaign_id,
+        daily_budget: Math.round(daily_budget_usd * 100),
+        optimization_goal,
+        billing_event,
+        targeting,
+        status,
+        ...(usedPixel && {
+          promoted_object: {
+            pixel_id: usedPixel,
+            custom_event_type: "PURCHASE",
+          },
+        }),
+        ...(start_time && { start_time }),
+        ...(end_time && { end_time }),
+      };
+
+      const d = await metaPost(`/act_${META_ACCOUNT_ID}/adsets`, body);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ success: true, adset_id: d.id, name, campaign_id, budget: `$${daily_budget_usd}`, гео: countries, статус: status }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── update_targeting ───────────────────────────────────────────────────────
+  s.tool(
+    "update_targeting",
+    "Менять гео, возраст, пол, языки адсета на лету",
+    {
+      adset_id: z.string(),
+      countries: z.array(z.string()).optional(),
+      age_min: z.number().optional(),
+      age_max: z.number().optional(),
+      genders: z.array(z.number()).optional().describe("1=мужской, 2=женский, [] = все"),
+      languages: z.array(z.number()).optional(),
+    },
+    async ({ adset_id, countries, age_min, age_max, genders, languages }) => {
+      // Сначала получаем текущий таргетинг
+      const current = await metaGet(`/${adset_id}`, { fields: "targeting" });
+      const targeting = { ...current.targeting };
+
+      if (countries) targeting.geo_locations = countries.includes("WORLDWIDE") ? { location_types: ["home", "recent"] } : { countries };
+      if (age_min !== undefined) targeting.age_min = age_min;
+      if (age_max !== undefined) targeting.age_max = age_max;
+      if (genders !== undefined) targeting.genders = genders.length ? genders : undefined;
+      if (languages !== undefined) targeting.locales = languages.length ? languages : undefined;
+
+      await metaPost(`/${adset_id}`, { targeting });
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ success: true, adset_id, обновлено: { countries, age_min, age_max, genders, languages } }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── upload_image ───────────────────────────────────────────────────────────
+  s.tool(
+    "upload_image",
+    "Загрузить изображение по URL в библиотеку рекламного аккаунта",
+    {
+      image_url: z.string().describe("Публичный URL изображения"),
+      name: z.string().optional().describe("Название файла"),
+    },
+    async ({ image_url, name }) => {
+      const body = { url: image_url };
+      if (name) body.name = name;
+      const d = await metaPost(`/act_${META_ACCOUNT_ID}/adimages`, body);
+      const imgData = d.images?.[Object.keys(d.images || {})[0]];
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ success: true, hash: imgData?.hash, url: imgData?.url, permalink_url: imgData?.permalink_url }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── create_ad ──────────────────────────────────────────────────────────────
+  s.tool(
+    "create_ad",
+    "Создать объявление с новым крео, текстом и заголовком",
+    {
+      name: z.string(),
+      adset_id: z.string(),
+      page_id: z.string().describe("Facebook Page ID"),
+      primary_text: z.string().describe("Основной текст объявления"),
+      headline: z.string().optional().describe("Заголовок"),
+      description: z.string().optional().describe("Описание"),
+      link_url: z.string().describe("Ссылка куда ведёт объявление"),
+      image_hash: z.string().optional().describe("Хэш изображения из upload_image"),
+      video_id: z.string().optional().describe("ID видео"),
+      call_to_action: z.enum(["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "GET_OFFER", "BUY_NOW", "SUBSCRIBE"]).default("LEARN_MORE"),
+      status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
+    },
+    async ({ name, adset_id, page_id, primary_text, headline, description, link_url, image_hash, video_id, call_to_action, status }) => {
+      // Сначала создаём creative
+      const creativeBody = {
+        name: `creative_${name}`,
+        object_story_spec: {
+          page_id,
+          link_data: {
+            message: primary_text,
+            link: link_url,
+            call_to_action: { type: call_to_action, value: { link: link_url } },
+            ...(headline && { name: headline }),
+            ...(description && { description }),
+            ...(image_hash && { image_hash }),
+            ...(video_id && { video_id }),
+          },
+        },
+      };
+      const creative = await metaPost(`/act_${META_ACCOUNT_ID}/adcreatives`, creativeBody);
+
+      // Затем создаём объявление
+      const ad = await metaPost(`/act_${META_ACCOUNT_ID}/ads`, {
+        name,
+        adset_id,
+        creative: { creative_id: creative.id },
+        status,
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ success: true, ad_id: ad.id, creative_id: creative.id, name, статус: status }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── update_ad_creative ─────────────────────────────────────────────────────
+  s.tool(
+    "update_ad_creative",
+    "Обновить текст или заголовок существующего объявления",
+    {
+      ad_id: z.string(),
+      page_id: z.string(),
+      primary_text: z.string().optional(),
+      headline: z.string().optional(),
+      link_url: z.string().optional(),
+      image_hash: z.string().optional(),
+      call_to_action: z.enum(["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "GET_OFFER", "BUY_NOW", "SUBSCRIBE"]).optional(),
+    },
+    async ({ ad_id, page_id, primary_text, headline, link_url, image_hash, call_to_action }) => {
+      // Получаем текущий creative
+      const adData = await metaGet(`/${ad_id}`, { fields: "creative{id,object_story_spec}" });
+      const oldSpec = adData.creative?.object_story_spec?.link_data || {};
+
+      const newSpec = {
+        ...oldSpec,
+        ...(primary_text && { message: primary_text }),
+        ...(headline && { name: headline }),
+        ...(link_url && { link: link_url }),
+        ...(image_hash && { image_hash }),
+        ...(call_to_action && { call_to_action: { type: call_to_action, value: { link: link_url || oldSpec.link } } }),
+      };
+
+      const creative = await metaPost(`/act_${META_ACCOUNT_ID}/adcreatives`, {
+        name: `creative_updated_${Date.now()}`,
+        object_story_spec: { page_id, link_data: newSpec },
+      });
+
+      await metaPost(`/${ad_id}`, { creative: { creative_id: creative.id } });
+      return { content: [{ type: "text", text: `✅ Крео объявления ${ad_id} обновлено. Новый creative_id: ${creative.id}` }] };
+    }
+  );
+
+  // ── get_placements_breakdown ───────────────────────────────────────────────
+  s.tool(
+    "get_placements_breakdown",
+    "Разбивка по плейсментам: Feed / Reels / Stories / Audience Network",
+    {
+      days: z.number().default(7),
+      campaign_id: z.string().optional(),
+    },
+    async ({ days, campaign_id }) => {
+      const params = {
+        fields: `spend,impressions,clicks,ctr,cpc,actions,cost_per_action_type`,
+        breakdowns: "publisher_platform,platform_position",
+        ...dateRange(days),
+        limit: 100,
+      };
+      const url = campaign_id ? `/${campaign_id}/insights` : `/act_${META_ACCOUNT_ID}/insights`;
+      const data = await metaGet(url, params);
+
+      const rows = (data.data || []).map((r) => {
+        const purchases = parseInt(r.actions?.find((a) => a.action_type === "purchase")?.value || 0);
+        const spend = parseFloat(r.spend || 0);
+        return {
+          платформа: r.publisher_platform,
+          позиция: r.platform_position,
+          спенд: `$${spend.toFixed(2)}`,
+          покупки: purchases,
+          cpp: purchases > 0 ? `$${(spend / purchases).toFixed(2)}` : "нет",
+          ctr: r.ctr ? `${parseFloat(r.ctr).toFixed(2)}%` : "0%",
+          cpc: r.cpc ? `$${parseFloat(r.cpc).toFixed(2)}` : null,
+        };
+      }).sort((a, b) => parseFloat(b.спенд.replace("$","")) - parseFloat(a.спенд.replace("$","")));
+
+      return { content: [{ type: "text", text: JSON.stringify({ период_дней: days, плейсменты: rows }, null, 2) }] };
+    }
+  );
+
+  // ── pause_all_emergency ────────────────────────────────────────────────────
+  s.tool(
+    "pause_all_emergency",
+    "⛔ ЭКСТРЕННАЯ ОСТАНОВКА — поставить все активные кампании на паузу",
+    { confirm: z.boolean().describe("Обязательно true для выполнения") },
+    async ({ confirm }) => {
+      if (!confirm) return { content: [{ type: "text", text: "⛔ Не выполнено. Передай confirm: true для подтверждения." }] };
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, {
+        fields: "id,name,status",
+        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+        limit: 100,
+      });
+      const results = [];
+      for (const c of data.data || []) {
+        await metaPost(`/${c.id}`, { status: "PAUSED" });
+        results.push(c.name);
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ ⛔: "ВСЕ КАМПАНИИ ОСТАНОВЛЕНЫ", остановлено: results.length, кампании: results }, null, 2) }] };
+    }
+  );
+
+  // ── get_account_limits ─────────────────────────────────────────────────────
+  s.tool(
+    "get_account_limits",
+    "Проверить лимиты аккаунта: спенд-лимит, остаток, статус",
+    {},
+    async () => {
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}`, {
+        fields: "name,account_status,currency,spend_cap,amount_spent,balance,disable_reason,timezone_name",
+      });
+      const statusMap = { 1: "✅ ACTIVE", 2: "⛔ DISABLED", 3: "⚠️ UNSETTLED", 7: "🔒 PENDING_RISK_REVIEW", 9: "🚫 IN_GRACE_PERIOD", 101: "⛔ TEMP_DISABLED" };
+      const spent = parseFloat(data.amount_spent || 0) / 100;
+      const cap = data.spend_cap ? parseFloat(data.spend_cap) / 100 : null;
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            аккаунт: data.name,
+            статус: statusMap[data.account_status] || data.account_status,
+            валюта: data.currency,
+            потрачено_всего: `$${spent.toFixed(2)}`,
+            spend_cap: cap ? `$${cap.toFixed(2)}` : "не установлен",
+            остаток_до_лимита: cap ? `$${(cap - spent).toFixed(2)}` : "∞",
+            баланс: data.balance ? `$${(parseFloat(data.balance) / 100).toFixed(2)}` : null,
+            timezone: data.timezone_name,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
 }
 
 // ── Express ────────────────────────────────────────────────────────────────────
@@ -814,7 +1136,7 @@ function registerTools(s) {
 const app = express();
 const transports = new Map();
 
-app.get("/", (req, res) => res.send("FB Ads MCP Server ✅ v2.1.0"));
+app.get("/", (req, res) => res.send("FB Ads MCP Server ✅ v3.0.0"));
 app.get("/health", (req, res) =>
   res.json({ status: "ok", account: META_ACCOUNT_ID ? "connected" : "no token" })
 );
@@ -861,6 +1183,6 @@ app.post("/messages", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 FB Ads MCP v2.1.0 on port ${PORT}`);
+  console.log(`🚀 FB Ads MCP v3.0.0 on port ${PORT}`);
   console.log(`   Account: act_${META_ACCOUNT_ID}`);
 });
