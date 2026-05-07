@@ -384,6 +384,428 @@ function registerTools(s) {
       };
     }
   );
+
+  // ── get_ads_today ──────────────────────────────────────────────────────────
+  s.tool(
+    "get_ads_today",
+    "Объявления с метриками строго за сегодня",
+    { status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ALL") },
+    async ({ status }) => {
+      const params = {
+        fields: `name,status,creative{title,body},insights{${INSIGHTS_FIELDS}}`,
+        limit: 100,
+        ...todayRange(),
+      };
+      if (status !== "ALL") {
+        params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
+      }
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/ads`, params);
+      const ads = (data.data || []).map((a) => {
+        const ins = a.insights?.data?.[0];
+        const { purchases, cpp } = parsePurchases(ins);
+        const spend = parseFloat(ins?.spend || 0);
+        const flag = spend >= 4 && purchases === 0 ? "🔴 ВЫКЛЮЧИТЬ"
+          : purchases > 0 && cpp && parseFloat(cpp) < 5 ? "🟢 ПОБЕДИТЕЛЬ"
+          : "🟡 НАБЛЮДАТЬ";
+        return {
+          id: a.id, name: a.name, status: a.status,
+          creative: a.creative?.body?.substring(0, 80),
+          спенд: `$${spend.toFixed(2)}`,
+          покупки: purchases,
+          cpp: cpp ? `$${cpp}` : "нет",
+          ctr: ins?.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
+          флаг: flag,
+        };
+      });
+      return { content: [{ type: "text", text: JSON.stringify({ дата: fmtDate(new Date()), всего: ads.length, ads }, null, 2) }] };
+    }
+  );
+
+  // ── get_campaign_stats ─────────────────────────────────────────────────────
+  s.tool(
+    "get_campaign_stats",
+    "Детальная статистика по одной кампании за любой период",
+    {
+      campaign_id: z.string(),
+      days: z.number().default(7),
+    },
+    async ({ campaign_id, days }) => {
+      const [campaign, adsets] = await Promise.all([
+        metaGet(`/${campaign_id}`, { fields: `name,status,daily_budget,lifetime_budget,objective,insights{${INSIGHTS_FIELDS}}`, ...dateRange(days) }),
+        metaGet(`/${campaign_id}/adsets`, { fields: `name,status,daily_budget,insights{${INSIGHTS_FIELDS}}`, ...dateRange(days), limit: 50 }),
+      ]);
+      const ins = campaign.insights?.data?.[0];
+      const { purchases, cpp, revenue, roas } = parsePurchases(ins);
+      const adsetList = (adsets.data || []).map((a) => {
+        const ai = a.insights?.data?.[0];
+        const ap = parsePurchases(ai);
+        return {
+          id: a.id, name: a.name, status: a.status,
+          daily_budget: a.daily_budget ? `$${(a.daily_budget / 100).toFixed(2)}` : null,
+          спенд: `$${parseFloat(ai?.spend || 0).toFixed(2)}`,
+          покупки: ap.purchases, cpp: ap.cpp ? `$${ap.cpp}` : "нет",
+          ctr: ai?.ctr ? `${parseFloat(ai.ctr).toFixed(2)}%` : "0%",
+        };
+      });
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            кампания: campaign.name, статус: campaign.status, период_дней: days,
+            итого: { спенд: `$${parseFloat(ins?.spend || 0).toFixed(2)}`, покупки: purchases, cpp: cpp ? `$${cpp}` : "нет", roas: roas ? `${roas}x` : null, выручка: `$${revenue}` },
+            адсеты: adsetList,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── get_hourly_stats ───────────────────────────────────────────────────────
+  s.tool(
+    "get_hourly_stats",
+    "Разбивка расхода и покупок по часам за сегодня или вчера",
+    { day: z.enum(["today", "yesterday"]).default("today") },
+    async ({ day }) => {
+      const range = day === "today" ? todayRange() : yesterdayRange();
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
+        fields: "spend,actions,impressions",
+        time_increment: "1",
+        breakdowns: "hourly_stats_aggregated_by_advertiser_time_zone",
+        ...range,
+      });
+      const hours = (data.data || []).map((h) => {
+        const purchases = parseInt(h.actions?.find((a) => a.action_type === "purchase")?.value || 0);
+        return { час: h.hourly_stats_aggregated_by_advertiser_time_zone, спенд: `$${parseFloat(h.spend || 0).toFixed(2)}`, покупки: purchases };
+      }).sort((a, b) => a.час?.localeCompare(b.час));
+      return { content: [{ type: "text", text: JSON.stringify({ день: day, разбивка_по_часам: hours }, null, 2) }] };
+    }
+  );
+
+  // ── get_audience_insights ──────────────────────────────────────────────────
+  s.tool(
+    "get_audience_insights",
+    "Кто реально покупает: возраст, пол, регион",
+    {
+      days: z.number().default(14),
+      breakdown: z.enum(["age", "gender", "region", "age,gender"]).default("age,gender"),
+    },
+    async ({ days, breakdown }) => {
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
+        fields: `spend,impressions,clicks,ctr,actions,cost_per_action_type`,
+        breakdowns: breakdown,
+        ...dateRange(days),
+        limit: 100,
+      });
+      const rows = (data.data || []).map((r) => {
+        const purchases = parseInt(r.actions?.find((a) => a.action_type === "purchase")?.value || 0);
+        const spend = parseFloat(r.spend || 0);
+        return {
+          ...(r.age && { возраст: r.age }),
+          ...(r.gender && { пол: r.gender }),
+          ...(r.region && { регион: r.region }),
+          спенд: `$${spend.toFixed(2)}`,
+          покупки: purchases,
+          cpp: purchases > 0 ? `$${(spend / purchases).toFixed(2)}` : "нет",
+          ctr: r.ctr ? `${parseFloat(r.ctr).toFixed(2)}%` : "0%",
+        };
+      }).sort((a, b) => (b.покупки || 0) - (a.покупки || 0));
+      return { content: [{ type: "text", text: JSON.stringify({ разбивка: breakdown, период_дней: days, аудитория: rows }, null, 2) }] };
+    }
+  );
+
+  // ── get_frequency_alert ────────────────────────────────────────────────────
+  s.tool(
+    "get_frequency_alert",
+    "Флаг адсетов где частота превышает порог — признак выгорания аудитории",
+    {
+      threshold: z.number().default(2.5).describe("Порог частоты"),
+      days: z.number().default(7),
+    },
+    async ({ threshold, days }) => {
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
+        fields: `name,status,insights{frequency,spend,reach,impressions}`,
+        ...dateRange(days), limit: 100,
+        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+      });
+      const alerts = (data.data || [])
+        .map((a) => {
+          const ins = a.insights?.data?.[0];
+          const freq = parseFloat(ins?.frequency || 0);
+          return { id: a.id, name: a.name, frequency: freq, охват: ins?.reach || 0, спенд: `$${parseFloat(ins?.spend || 0).toFixed(2)}` };
+        })
+        .filter((a) => a.frequency >= threshold)
+        .sort((a, b) => b.frequency - a.frequency);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            порог: threshold, период_дней: days,
+            всего_с_проблемой: alerts.length,
+            адсеты: alerts.map((a) => ({ ...a, рекомендация: a.frequency > 4 ? "🔴 срочно расширить аудиторию или выключить" : "⚠️ следить" })),
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── duplicate_ad ───────────────────────────────────────────────────────────
+  s.tool(
+    "duplicate_ad",
+    "Дублировать объявление (для тестов нового крео)",
+    {
+      ad_id: z.string(),
+      adset_id: z.string().optional().describe("Адсет назначения (если не указан — тот же)"),
+      status_after: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
+    },
+    async ({ ad_id, adset_id, status_after }) => {
+      const body = { deep_copy: true, status_option: status_after };
+      if (adset_id) body.adset_id = adset_id;
+      const d = await metaPost(`/${ad_id}/copies`, body);
+      return { content: [{ type: "text", text: `✅ Объявление продублировано. ID: ${d.copied_ad_id || JSON.stringify(d)}. Статус: ${status_after}` }] };
+    }
+  );
+
+  // ── set_bid_cap ────────────────────────────────────────────────────────────
+  s.tool(
+    "set_bid_cap",
+    "Поставить ограничение ставки на адсет",
+    {
+      adset_id: z.string(),
+      bid_cap_usd: z.number().describe("Максимальная ставка в USD"),
+    },
+    async ({ adset_id, bid_cap_usd }) => {
+      const bid_amount = Math.round(bid_cap_usd * 100);
+      await metaPost(`/${adset_id}`, { bid_amount, bid_strategy: "LOWEST_COST_WITH_BID_CAP" });
+      return { content: [{ type: "text", text: `✅ Bid cap адсета ${adset_id} установлен: $${bid_cap_usd}` }] };
+    }
+  );
+
+  // ── get_budget_pacing ──────────────────────────────────────────────────────
+  s.tool(
+    "get_budget_pacing",
+    "Сколько бюджета потрачено от дневного в % с учётом времени суток",
+    {},
+    async () => {
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
+        fields: `name,status,daily_budget,insights{spend}`,
+        ...todayRange(), limit: 100,
+        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+      });
+      const now = new Date();
+      const dayPct = ((now.getHours() * 60 + now.getMinutes()) / 1440 * 100).toFixed(1);
+
+      const pacing = (data.data || [])
+        .filter((a) => a.daily_budget)
+        .map((a) => {
+          const budget = parseFloat(a.daily_budget) / 100;
+          const spent = parseFloat(a.insights?.data?.[0]?.spend || 0);
+          const spentPct = (spent / budget * 100).toFixed(1);
+          const diff = parseFloat(spentPct) - parseFloat(dayPct);
+          const status = diff < -20 ? "🐢 медленно" : diff > 20 ? "🔥 быстро (закончится раньше)" : "✅ норма";
+          return { name: a.name, budget: `$${budget.toFixed(2)}`, потрачено: `$${spent.toFixed(2)}`, потрачено_пct: `${spentPct}%`, день_прошёл_pct: `${dayPct}%`, темп: status };
+        });
+
+      return { content: [{ type: "text", text: JSON.stringify({ время: now.toTimeString().slice(0, 5), день_прошёл: `${dayPct}%`, адсеты: pacing }, null, 2) }] };
+    }
+  );
+
+  // ── get_alerts ─────────────────────────────────────────────────────────────
+  s.tool(
+    "get_alerts",
+    "Сводка аномалий: рост CPP, падение CTR, нулевые покупки, высокая частота",
+    {
+      max_cpp: z.number().default(6).describe("Порог CPP для алерта"),
+      min_ctr: z.number().default(0.5).describe("Минимальный CTR %"),
+      max_frequency: z.number().default(3.0),
+      spend_no_conv: z.number().default(4).describe("Спенд без конверсий для алерта"),
+    },
+    async ({ max_cpp, min_ctr, max_frequency, spend_no_conv }) => {
+      const [adsetsData, adsData] = await Promise.all([
+        metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
+          fields: `name,status,insights{spend,ctr,frequency,actions}`,
+          ...todayRange(), limit: 100,
+          filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+        }),
+        metaGet(`/act_${META_ACCOUNT_ID}/ads`, {
+          fields: `name,status,insights{spend,ctr,actions}`,
+          ...todayRange(), limit: 100,
+          filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+        }),
+      ]);
+
+      const alerts = [];
+
+      for (const a of adsetsData.data || []) {
+        const ins = a.insights?.data?.[0];
+        const spend = parseFloat(ins?.spend || 0);
+        const ctr = parseFloat(ins?.ctr || 0);
+        const freq = parseFloat(ins?.frequency || 0);
+        const purchases = parseInt(ins?.actions?.find((x) => x.action_type === "purchase")?.value || 0);
+        const cpp = purchases > 0 ? spend / purchases : null;
+        if (spend >= spend_no_conv && purchases === 0) alerts.push({ тип: "🔴 НЕТ КОНВЕРСИЙ", объект: "адсет", name: a.name, детали: `$${spend.toFixed(2)} потрачено, 0 покупок` });
+        if (cpp && cpp > max_cpp) alerts.push({ тип: "🔴 ВЫСОКИЙ CPP", объект: "адсет", name: a.name, детали: `CPP $${cpp.toFixed(2)} > порога $${max_cpp}` });
+        if (spend > 2 && ctr < min_ctr) alerts.push({ тип: "⚠️ НИЗКИЙ CTR", объект: "адсет", name: a.name, детали: `CTR ${ctr.toFixed(2)}% < ${min_ctr}%` });
+        if (freq > max_frequency) alerts.push({ тип: "⚠️ ВЫСОКАЯ ЧАСТОТА", объект: "адсет", name: a.name, детали: `Frequency ${freq.toFixed(2)} > ${max_frequency}` });
+      }
+
+      for (const a of adsData.data || []) {
+        const ins = a.insights?.data?.[0];
+        const spend = parseFloat(ins?.spend || 0);
+        const purchases = parseInt(ins?.actions?.find((x) => x.action_type === "purchase")?.value || 0);
+        if (spend >= spend_no_conv && purchases === 0) alerts.push({ тип: "🔴 НЕТ КОНВЕРСИЙ", объект: "объявление", name: a.name, детали: `$${spend.toFixed(2)} потрачено, 0 покупок — выключить` });
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ время: new Date().toTimeString().slice(0, 5), всего_алертов: alerts.length, алерты: alerts }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── get_daily_summary ──────────────────────────────────────────────────────
+  s.tool(
+    "get_daily_summary",
+    "Итог дня одной командой: расход / покупки / ROAS / лучший крео / что выключить",
+    {},
+    async () => {
+      const [accToday, accYest, adsToday] = await Promise.all([
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...todayRange() }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...yesterdayRange() }),
+        metaGet(`/act_${META_ACCOUNT_ID}/ads`, {
+          fields: `name,status,creative{title,body},insights{${INSIGHTS_FIELDS}}`,
+          ...todayRange(), limit: 100,
+        }),
+      ]);
+
+      const today = parsePurchases(accToday.data?.[0]);
+      const yest = parsePurchases(accYest.data?.[0]);
+      const todayIns = accToday.data?.[0] || {};
+      const yesterdayIns = accYest.data?.[0] || {};
+
+      const ads = (adsToday.data || []).map((a) => {
+        const ins = a.insights?.data?.[0];
+        const { purchases, cpp } = parsePurchases(ins);
+        const spend = parseFloat(ins?.spend || 0);
+        return { id: a.id, name: a.name, spend, purchases, cpp: cpp ? parseFloat(cpp) : null, ctr: parseFloat(ins?.ctr || 0) };
+      });
+
+      const winner = ads.filter((a) => a.purchases > 0).sort((a, b) => (a.cpp || 99) - (b.cpp || 99))[0];
+      const toKill = ads.filter((a) => a.spend >= 4 && a.purchases === 0);
+
+      const spendToday = parseFloat(todayIns.spend || 0);
+      const spendYest = parseFloat(yesterdayIns.spend || 0);
+      const purchDelta = today.purchases - yest.purchases;
+      const spendDelta = spendToday - spendYest;
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            дата: fmtDate(new Date()),
+            сегодня: {
+              спенд: `$${spendToday.toFixed(2)}`,
+              покупки: today.purchases,
+              cpp: today.cpp ? `$${today.cpp}` : "нет конверсий",
+              roas: today.roas ? `${today.roas}x` : null,
+              ctr: todayIns.ctr ? `${parseFloat(todayIns.ctr).toFixed(2)}%` : "0%",
+            },
+            vs_вчера: {
+              покупки: `${purchDelta >= 0 ? "+" : ""}${purchDelta}`,
+              спенд: `${spendDelta >= 0 ? "+" : ""}$${spendDelta.toFixed(2)}`,
+            },
+            лучший_крео: winner ? { name: winner.name, покупки: winner.purchases, cpp: `$${winner.cpp.toFixed(2)}` } : "нет конверсий сегодня",
+            выключить: toKill.map((a) => ({ name: a.name, спенд: `$${a.spend.toFixed(2)}`, причина: "$4+ без покупок" })),
+            итог: toKill.length > 0 ? `⚠️ ${toKill.length} объявлений нужно выключить` : "✅ Всё в порядке",
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── get_ab_test_results ────────────────────────────────────────────────────
+  s.tool(
+    "get_ab_test_results",
+    "Сравнение двух крео или адсетов по ключевым метрикам",
+    {
+      id_a: z.string().describe("ID первого объявления или адсета"),
+      id_b: z.string().describe("ID второго объявления или адсета"),
+      type: z.enum(["ad", "adset"]).default("ad"),
+      days: z.number().default(7),
+    },
+    async ({ id_a, id_b, type, days }) => {
+      const fields = `name,status,insights{${INSIGHTS_FIELDS}}`;
+      const [a, b] = await Promise.all([
+        metaGet(`/${id_a}`, { fields, ...dateRange(days) }),
+        metaGet(`/${id_b}`, { fields, ...dateRange(days) }),
+      ]);
+      const parse = (obj) => {
+        const ins = obj.insights?.data?.[0];
+        const { purchases, cpp, roas } = parsePurchases(ins);
+        const spend = parseFloat(ins?.spend || 0);
+        return { name: obj.name, спенд: `$${spend.toFixed(2)}`, покупки: purchases, cpp: cpp ? `$${cpp}` : "нет", roas: roas ? `${roas}x` : null, ctr: ins?.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%", cpc: ins?.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null, frequency: ins?.frequency ? parseFloat(ins.frequency).toFixed(2) : null, _spend: spend, _cpp: cpp ? parseFloat(cpp) : null, _purchases: purchases };
+      };
+      const ra = parse(a), rb = parse(b);
+      const winner = ra._cpp && rb._cpp ? (ra._cpp < rb._cpp ? "A" : "B") : ra._purchases > rb._purchases ? "A" : rb._purchases > ra._purchases ? "B" : "нет данных";
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            период_дней: days,
+            A: ra, B: rb,
+            победитель: winner,
+            рекомендация: winner !== "нет данных" ? `Масштабировать ${winner}, выключить ${winner === "A" ? "B" : "A"} если разница стабильна 3+ дня` : "Недостаточно данных — ждать минимум 3 дня",
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // ── get_winner_recommendation ──────────────────────────────────────────────
+  s.tool(
+    "get_winner_recommendation",
+    "Автовывод победителя среди всех активных крео с рекомендацией по каждому",
+    { days: z.number().default(7), min_spend_usd: z.number().default(3) },
+    async ({ days, min_spend_usd }) => {
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/ads`, {
+        fields: `name,status,adset_id,creative{title,body},insights{${INSIGHTS_FIELDS}}`,
+        ...dateRange(days), limit: 100,
+      });
+      const ads = (data.data || [])
+        .map((a) => {
+          const ins = a.insights?.data?.[0];
+          const spend = parseFloat(ins?.spend || 0);
+          const { purchases, cpp, roas } = parsePurchases(ins);
+          const ctr = parseFloat(ins?.ctr || 0);
+          const freq = parseFloat(ins?.frequency || 0);
+          let action = "⏳ мало данных";
+          if (spend >= min_spend_usd) {
+            if (purchases === 0 && spend >= 4) action = "🔴 выключить";
+            else if (cpp && parseFloat(cpp) <= 5 && purchases >= 2) action = "🟢 масштабировать";
+            else if (ctr < 0.5 && spend > 5) action = "🟡 проблема с CTR — сменить крео";
+            else if (freq > 3) action = "🟡 аудитория выгорает";
+            else if (purchases > 0) action = "🟡 наблюдать ещё 1-2 дня";
+          }
+          return { name: a.name, спенд: `$${spend.toFixed(2)}`, покупки: purchases, cpp: cpp ? `$${cpp}` : "нет", ctr: `${ctr.toFixed(2)}%`, frequency: freq.toFixed(2), действие: action, _purchases: purchases, _cpp: cpp ? parseFloat(cpp) : 99, _spend: spend };
+        })
+        .filter((a) => a._spend >= min_spend_usd)
+        .sort((a, b) => b._purchases - a._purchases || a._cpp - b._cpp);
+
+      const winner = ads.find((a) => a._purchases >= 2 && a._cpp <= 5);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            период_дней: days,
+            победитель: winner ? { name: winner.name, cpp: winner.cpp, покупки: winner.покупки } : "не определён — нужно больше данных",
+            все_крео: ads,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
 }
 
 // ── Express ────────────────────────────────────────────────────────────────────
