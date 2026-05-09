@@ -10,7 +10,8 @@ const META_PIXEL_ID = process.env.META_PIXEL_ID;
 const META_PAGE_ID = process.env.META_PAGE_ID;
 const PORT = process.env.PORT || 10000;
 const BASE = "https://graph.facebook.com/v19.0";
-const ATTRIBUTION = ["7d_click", "1d_view"];
+
+// -- Helpers -------------------------------------------------------------------
 
 async function metaGet(path, params = {}) {
   const qs = new URLSearchParams({ access_token: META_TOKEN, ...params });
@@ -35,6 +36,7 @@ function fmtDate(d) {
   return d.toISOString().split("T")[0];
 }
 
+// FIX: days=1 = only today, days=7 = last 7 days including today
 function dateRange(days) {
   const until = new Date();
   const since = new Date(until);
@@ -54,17 +56,18 @@ function yesterdayRange() {
   return { time_range: JSON.stringify({ since: y, until: y }) };
 }
 
+// FIX: action_attribution_windows as separate param, not in fields
+const ATTRIBUTION_WINDOWS = JSON.stringify(["7d_click", "1d_view"]);
+
 const INSIGHTS_FIELDS = [
   "spend", "impressions", "reach", "clicks",
   "ctr", "cpc", "cpm", "frequency",
   "actions", "cost_per_action_type", "action_values",
 ].join(",");
 
-function insightsParams(range) {
-  return {
-    ...range,
-    action_attribution_windows: JSON.stringify(ATTRIBUTION),
-  };
+// Wrap any range with correct attribution param
+function withAttribution(rangeObj) {
+  return { ...rangeObj, action_attribution_windows: ATTRIBUTION_WINDOWS };
 }
 
 function parsePurchases(ins) {
@@ -78,10 +81,10 @@ function parsePurchases(ins) {
 }
 
 function adFlag(spend, purchases, ctr, freq) {
-  if (spend >= 4 && purchases === 0) return "VYKLYUCHIT ($4+ bez pokupok)";
-  if (freq > 3) return "USTALOST freq > 3";
-  if (ctr < 0.5 && spend > 3) return "NIZKIY CTR";
-  if (purchases > 0 && parseFloat(spend / purchases) < 5) return "POBEDITEL";
+  if (spend >= 4 && purchases === 0) return "VYKLYUCHIT";
+  if (freq > 3) return "USTALOST_freq>3";
+  if (ctr < 0.5 && spend > 3) return "NIZKIY_CTR";
+  if (purchases > 0 && spend > 0 && (spend / purchases) < 5) return "POBEDITEL";
   return "NABLYUDAT";
 }
 
@@ -91,81 +94,121 @@ function promotedObject(pixelId) {
   return { promoted_object: { pixel_id: pid, custom_event_type: "PURCHASE" } };
 }
 
+// -- Tools ---------------------------------------------------------------------
+
 function registerTools(s) {
 
   // HELLO
   s.tool("hello", "Proverka svyazi s serverom", {}, async () => ({
-    content: [{ type: "text", text: "FB Ads MCP v3.1.0 podklyuchen!" }],
+    content: [{ type: "text", text: "FB Ads MCP v3.2.0 - OK" }],
   }));
 
-  // GET ACCOUNT OVERVIEW
+  // GET ACCOUNT LIMITS
+  s.tool("get_account_limits", "Proverit limity akkaunta: spend-limit, ostatok, status", {}, async () => {
+    const data = await metaGet(`/act_${META_ACCOUNT_ID}`, {
+      fields: "name,account_status,currency,spend_cap,amount_spent,balance,disable_reason,timezone_name",
+    });
+    const statusMap = { 1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW", 101: "TEMP_DISABLED" };
+    const spent = parseFloat(data.amount_spent || 0) / 100;
+    const cap = data.spend_cap ? parseFloat(data.spend_cap) / 100 : null;
+    return {
+      content: [{ type: "text", text: JSON.stringify({
+        account: data.name,
+        status: statusMap[data.account_status] || String(data.account_status),
+        currency: data.currency,
+        spent_total: `$${spent.toFixed(2)}`,
+        spend_cap: cap ? `$${cap.toFixed(2)}` : "ne ustanovlen",
+        remaining: cap ? `$${(cap - spent).toFixed(2)}` : "unlimited",
+        balance: data.balance ? `$${(parseFloat(data.balance) / 100).toFixed(2)}` : null,
+        timezone: data.timezone_name,
+      }, null, 2) }],
+    };
+  });
+
+  // GET ACCOUNT OVERVIEW - today vs yesterday comparison always included
   s.tool(
     "get_account_overview",
     "Obshchaya svodka po reklamnomu kabinetu s sravneniem segodnya/vchera",
-    { days: z.number().min(1).max(90).default(14) },
+    { days: z.number().min(1).max(90).default(7) },
     async ({ days }) => {
       const [main, today, yest] = await Promise.all([
-        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...insightsParams(dateRange(days)) }),
-        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...insightsParams(todayRange()) }),
-        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...insightsParams(yesterdayRange()) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...withAttribution(dateRange(days)) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...withAttribution(todayRange()) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...withAttribution(yesterdayRange()) }),
       ]);
       const ins = main.data?.[0] || {};
       const { purchases, cpp, revenue, roas } = parsePurchases(ins);
       const t = parsePurchases(today.data?.[0]);
       const y = parsePurchases(yest.data?.[0]);
+      const tIns = today.data?.[0] || {};
+      const yIns = yest.data?.[0] || {};
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            period_days: days,
-            itogo: {
-              spend: `$${parseFloat(ins.spend || 0).toFixed(2)}`,
-              impressions: ins.impressions || 0,
-              clicks: ins.clicks || 0,
-              ctr: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
-              cpc: ins.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null,
-              cpm: ins.cpm ? `$${parseFloat(ins.cpm).toFixed(2)}` : null,
-              purchases, cpp: cpp ? `$${cpp}` : "net konversiy",
-              revenue: `$${revenue}`, roas: roas ? `${roas}x` : null,
-            },
-            segodnya: { spend: `$${parseFloat(today.data?.[0]?.spend || 0).toFixed(2)}`, purchases: t.purchases, cpp: t.cpp ? `$${t.cpp}` : "net", roas: t.roas ? `${t.roas}x` : null },
-            vchera: { spend: `$${parseFloat(yest.data?.[0]?.spend || 0).toFixed(2)}`, purchases: y.purchases, cpp: y.cpp ? `$${y.cpp}` : "net", roas: y.roas ? `${y.roas}x` : null },
-          }, null, 2),
-        }],
+        content: [{ type: "text", text: JSON.stringify({
+          period_days: days,
+          itogo: {
+            spend: `$${parseFloat(ins.spend || 0).toFixed(2)}`,
+            impressions: ins.impressions || 0, clicks: ins.clicks || 0,
+            ctr: ins.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
+            cpc: ins.cpc ? `$${parseFloat(ins.cpc).toFixed(2)}` : null,
+            cpm: ins.cpm ? `$${parseFloat(ins.cpm).toFixed(2)}` : null,
+            purchases, cpp: cpp ? `$${cpp}` : "net", revenue: `$${revenue}`, roas: roas ? `${roas}x` : null,
+          },
+          segodnya: {
+            spend: `$${parseFloat(tIns.spend || 0).toFixed(2)}`,
+            purchases: t.purchases, cpp: t.cpp ? `$${t.cpp}` : "net", roas: t.roas ? `${t.roas}x` : null,
+            ctr: tIns.ctr ? `${parseFloat(tIns.ctr).toFixed(2)}%` : "0%",
+          },
+          vchera: {
+            spend: `$${parseFloat(yIns.spend || 0).toFixed(2)}`,
+            purchases: y.purchases, cpp: y.cpp ? `$${y.cpp}` : "net", roas: y.roas ? `${y.roas}x` : null,
+          },
+        }, null, 2) }],
       };
     }
   );
 
-  // GET CAMPAIGNS
+  // GET CAMPAIGNS - FIX: date_preset applied correctly
   s.tool(
     "get_campaigns",
     "Spisok kampaniy s metrikami",
     {
-      days: z.number().min(1).max(90).default(14),
+      days: z.number().min(1).max(90).default(7),
+      date_preset: z.enum(["today", "yesterday", "custom"]).default("custom"),
       status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ALL"),
       limit: z.number().min(10).max(200).default(50),
     },
-    async ({ days, status, limit }) => {
+    async ({ days, date_preset, status, limit }) => {
+      // FIX: apply correct range based on date_preset
+      const range = date_preset === "today" ? todayRange()
+        : date_preset === "yesterday" ? yesterdayRange()
+        : dateRange(days);
+
       const params = {
         fields: `name,status,daily_budget,lifetime_budget,objective,insights{${INSIGHTS_FIELDS}}`,
         limit,
-        ...insightsParams(dateRange(days)),
+        ...withAttribution(range),
       };
-      if (status !== "ALL") params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
+      if (status !== "ALL") {
+        params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
+      }
       const data = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, params);
       const campaigns = (data.data || []).map((c) => {
         const ins = c.insights?.data?.[0];
         const { purchases, cpp, roas } = parsePurchases(ins);
+        const spend = parseFloat(ins?.spend || 0);
         return {
           id: c.id, name: c.name, status: c.status,
           daily_budget: c.daily_budget ? `$${(c.daily_budget / 100).toFixed(2)}` : null,
-          spend: ins ? `$${parseFloat(ins.spend).toFixed(2)}` : "$0",
-          purchases, cpp: cpp ? `$${cpp}` : "net", roas: roas ? `${roas}x` : null,
+          // FIX: show $0 explicitly for new/inactive instead of hiding
+          spend: `$${spend.toFixed(2)}`,
+          purchases, cpp: cpp ? `$${cpp}` : "net",
+          roas: roas ? `${roas}x` : null,
           ctr: ins?.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
           frequency: ins?.frequency ? parseFloat(ins.frequency).toFixed(2) : null,
+          no_data: !ins,
         };
       });
-      return { content: [{ type: "text", text: JSON.stringify({ vsego: campaigns.length, campaigns }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ period: date_preset !== "custom" ? date_preset : `${days}d`, vsego: campaigns.length, campaigns }, null, 2) }] };
     }
   );
 
@@ -175,14 +218,16 @@ function registerTools(s) {
     "Poluchit adsety kampanii ili vsego kabineta",
     {
       campaign_id: z.string().optional(),
-      days: z.number().default(14),
+      days: z.number().default(7),
+      date_preset: z.enum(["today", "yesterday", "custom"]).default("custom"),
       status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ALL"),
     },
-    async ({ campaign_id, days, status }) => {
+    async ({ campaign_id, days, date_preset, status }) => {
+      const range = date_preset === "today" ? todayRange() : date_preset === "yesterday" ? yesterdayRange() : dateRange(days);
       const params = {
         fields: `name,status,daily_budget,campaign{name},insights{${INSIGHTS_FIELDS}}`,
         limit: 100,
-        ...insightsParams(dateRange(days)),
+        ...withAttribution(range),
       };
       if (status !== "ALL") params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
       const url = campaign_id ? `/${campaign_id}/adsets` : `/act_${META_ACCOUNT_ID}/adsets`;
@@ -206,7 +251,7 @@ function registerTools(s) {
     }
   );
 
-  // GET ADS
+  // GET ADS - with campaign_name field
   s.tool(
     "get_ads",
     "Spisok obyavleniy so statusom i metrikami",
@@ -214,13 +259,15 @@ function registerTools(s) {
       campaign_id: z.string().optional(),
       adset_id: z.string().optional(),
       days: z.number().default(7),
+      date_preset: z.enum(["today", "yesterday", "custom"]).default("custom"),
       status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ALL"),
     },
-    async ({ campaign_id, adset_id, days, status }) => {
+    async ({ campaign_id, adset_id, days, date_preset, status }) => {
+      const range = date_preset === "today" ? todayRange() : date_preset === "yesterday" ? yesterdayRange() : dateRange(days);
       const params = {
-        fields: `name,status,creative{title,body,image_url},insights{${INSIGHTS_FIELDS}}`,
+        fields: `name,status,campaign{name},adset{name},creative{title,body,image_url},insights{${INSIGHTS_FIELDS}}`,
         limit: 100,
-        ...insightsParams(dateRange(days)),
+        ...withAttribution(range),
       };
       if (status !== "ALL") params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
       const url = adset_id ? `/${adset_id}/ads` : campaign_id ? `/${campaign_id}/ads` : `/act_${META_ACCOUNT_ID}/ads`;
@@ -233,6 +280,8 @@ function registerTools(s) {
         const freq = parseFloat(ins?.frequency || 0);
         return {
           id: a.id, name: a.name, status: a.status,
+          campaign_name: a.campaign?.name,
+          adset_name: a.adset?.name,
           creative_title: a.creative?.title,
           creative_body: a.creative?.body?.substring(0, 100),
           spend: `$${spend.toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net",
@@ -244,16 +293,17 @@ function registerTools(s) {
     }
   );
 
-  // GET ADS TODAY
+  // GET ADS TODAY - FIX: strictly today + campaign_name
   s.tool(
     "get_ads_today",
     "Obyavleniya s metrikami strogo za segodnya",
-    { status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ALL") },
+    { status: z.enum(["ACTIVE", "PAUSED", "ALL"]).default("ACTIVE") },
     async ({ status }) => {
       const params = {
-        fields: `name,status,creative{title,body},insights{${INSIGHTS_FIELDS}}`,
+        // FIX: campaign name added, strictly todayRange
+        fields: `name,status,campaign{name},adset{name},creative{title,body},insights{${INSIGHTS_FIELDS}}`,
         limit: 100,
-        ...insightsParams(todayRange()),
+        ...withAttribution(todayRange()),
       };
       if (status !== "ALL") params.filtering = JSON.stringify([{ field: "effective_status", operator: "IN", value: [status] }]);
       const data = await metaGet(`/act_${META_ACCOUNT_ID}/ads`, params);
@@ -261,12 +311,16 @@ function registerTools(s) {
         const ins = a.insights?.data?.[0];
         const { purchases, cpp } = parsePurchases(ins);
         const spend = parseFloat(ins?.spend || 0);
+        const ctr = parseFloat(ins?.ctr || 0);
+        const freq = parseFloat(ins?.frequency || 0);
         return {
           id: a.id, name: a.name, status: a.status,
-          creative: a.creative?.body?.substring(0, 80),
+          campaign_name: a.campaign?.name,
+          adset_name: a.adset?.name,
+          creative: a.creative?.body?.substring(0, 100),
           spend: `$${spend.toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net",
-          ctr: ins?.ctr ? `${parseFloat(ins.ctr).toFixed(2)}%` : "0%",
-          flag: adFlag(spend, purchases, parseFloat(ins?.ctr || 0), parseFloat(ins?.frequency || 0)),
+          ctr: `${ctr.toFixed(2)}%`, frequency: freq.toFixed(2),
+          flag: adFlag(spend, purchases, ctr, freq),
         };
       });
       return { content: [{ type: "text", text: JSON.stringify({ date: fmtDate(new Date()), vsego: ads.length, ads }, null, 2) }] };
@@ -277,47 +331,52 @@ function registerTools(s) {
   s.tool(
     "get_campaign_stats",
     "Detalnaya statistika po odnoy kampanii za lyuboy period",
-    { campaign_id: z.string(), days: z.number().default(7) },
-    async ({ campaign_id, days }) => {
-      const [campaign, adsets] = await Promise.all([
-        metaGet(`/${campaign_id}`, { fields: `name,status,daily_budget,objective,insights{${INSIGHTS_FIELDS}}`, ...insightsParams(dateRange(days)) }),
-        metaGet(`/${campaign_id}/adsets`, { fields: `name,status,daily_budget,insights{${INSIGHTS_FIELDS}}`, ...insightsParams(dateRange(days)), limit: 50 }),
+    {
+      campaign_id: z.string(),
+      days: z.number().default(7),
+      date_preset: z.enum(["today", "yesterday", "custom"]).default("custom"),
+    },
+    async ({ campaign_id, days, date_preset }) => {
+      const range = date_preset === "today" ? todayRange() : date_preset === "yesterday" ? yesterdayRange() : dateRange(days);
+      const [campaign, adsets, ads] = await Promise.all([
+        metaGet(`/${campaign_id}`, { fields: `name,status,daily_budget,objective,insights{${INSIGHTS_FIELDS}}`, ...withAttribution(range) }),
+        metaGet(`/${campaign_id}/adsets`, { fields: `name,status,daily_budget,insights{${INSIGHTS_FIELDS}}`, ...withAttribution(range), limit: 50 }),
+        metaGet(`/${campaign_id}/ads`, { fields: `name,status,insights{${INSIGHTS_FIELDS}}`, ...withAttribution(range), limit: 100 }),
       ]);
       const ins = campaign.insights?.data?.[0];
       const { purchases, cpp, revenue, roas } = parsePurchases(ins);
-      const adsetList = (adsets.data || []).map((a) => {
-        const ai = a.insights?.data?.[0];
-        const ap = parsePurchases(ai);
-        return {
-          id: a.id, name: a.name, status: a.status,
-          daily_budget: a.daily_budget ? `$${(a.daily_budget / 100).toFixed(2)}` : null,
-          spend: `$${parseFloat(ai?.spend || 0).toFixed(2)}`,
-          purchases: ap.purchases, cpp: ap.cpp ? `$${ap.cpp}` : "net",
-          ctr: ai?.ctr ? `${parseFloat(ai.ctr).toFixed(2)}%` : "0%",
-        };
-      });
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            campaign: campaign.name, status: campaign.status, days,
-            itogo: { spend: `$${parseFloat(ins?.spend || 0).toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net", roas: roas ? `${roas}x` : null, revenue: `$${revenue}` },
-            adsets: adsetList,
-          }, null, 2),
-        }],
+        content: [{ type: "text", text: JSON.stringify({
+          campaign: campaign.name, status: campaign.status,
+          period: date_preset !== "custom" ? date_preset : `${days}d`,
+          itogo: { spend: `$${parseFloat(ins?.spend || 0).toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net", roas: roas ? `${roas}x` : null, revenue: `$${revenue}` },
+          adsets: (adsets.data || []).map((a) => {
+            const ai = a.insights?.data?.[0]; const ap = parsePurchases(ai);
+            return { id: a.id, name: a.name, status: a.status, budget: a.daily_budget ? `$${(a.daily_budget/100).toFixed(2)}` : null, spend: `$${parseFloat(ai?.spend||0).toFixed(2)}`, purchases: ap.purchases, cpp: ap.cpp ? `$${ap.cpp}` : "net", ctr: ai?.ctr ? `${parseFloat(ai.ctr).toFixed(2)}%` : "0%" };
+          }),
+          ads: (ads.data || []).map((a) => {
+            const ai = a.insights?.data?.[0]; const ap = parsePurchases(ai);
+            const spend = parseFloat(ai?.spend||0);
+            return { id: a.id, name: a.name, status: a.status, spend: `$${spend.toFixed(2)}`, purchases: ap.purchases, cpp: ap.cpp ? `$${ap.cpp}` : "net", flag: adFlag(spend, ap.purchases, parseFloat(ai?.ctr||0), parseFloat(ai?.frequency||0)) };
+          }),
+        }, null, 2) }],
       };
     }
   );
 
-  // GET HOURLY STATS
+  // GET HOURLY STATS - FIX: added per-campaign breakdown
   s.tool(
     "get_hourly_stats",
     "Razбivka rashoda i pokupok po chasam za segodnya ili vchera",
-    { day: z.enum(["today", "yesterday"]).default("today") },
-    async ({ day }) => {
+    {
+      day: z.enum(["today", "yesterday"]).default("today"),
+      campaign_id: z.string().optional().describe("Esli ukazan - razбivka tolko po etoy kampanii"),
+    },
+    async ({ day, campaign_id }) => {
       const range = day === "today" ? todayRange() : yesterdayRange();
-      const data = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
-        fields: "spend,actions,impressions",
+      const url = campaign_id ? `/${campaign_id}/insights` : `/act_${META_ACCOUNT_ID}/insights`;
+      const data = await metaGet(url, {
+        fields: "spend,actions,impressions,clicks",
         time_increment: "1",
         breakdowns: "hourly_stats_aggregated_by_advertiser_time_zone",
         ...range,
@@ -326,8 +385,9 @@ function registerTools(s) {
         hour: h.hourly_stats_aggregated_by_advertiser_time_zone,
         spend: `$${parseFloat(h.spend || 0).toFixed(2)}`,
         purchases: parseInt(h.actions?.find((a) => a.action_type === "purchase")?.value || 0),
+        clicks: h.clicks || 0,
       })).sort((a, b) => (a.hour || "").localeCompare(b.hour || ""));
-      return { content: [{ type: "text", text: JSON.stringify({ day, hours }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ day, campaign_id: campaign_id || "all", hours }, null, 2) }] };
     }
   );
 
@@ -343,7 +403,7 @@ function registerTools(s) {
       const data = await metaGet(`/act_${META_ACCOUNT_ID}/insights`, {
         fields: `spend,impressions,clicks,ctr,actions,cost_per_action_type`,
         breakdowns: breakdown,
-        ...insightsParams(dateRange(days)),
+        ...withAttribution(dateRange(days)),
         limit: 100,
       });
       const rows = (data.data || []).map((r) => {
@@ -372,8 +432,7 @@ function registerTools(s) {
       const data = await metaGet(url, {
         fields: `spend,impressions,clicks,ctr,cpc,actions,cost_per_action_type`,
         breakdowns: "publisher_platform,platform_position",
-        ...insightsParams(dateRange(days)),
-        limit: 100,
+        ...withAttribution(dateRange(days)), limit: 100,
       });
       const rows = (data.data || []).map((r) => {
         const purchases = parseInt(r.actions?.find((a) => a.action_type === "purchase")?.value || 0);
@@ -384,7 +443,7 @@ function registerTools(s) {
           cpp: purchases > 0 ? `$${(spend / purchases).toFixed(2)}` : "net",
           ctr: r.ctr ? `${parseFloat(r.ctr).toFixed(2)}%` : "0%",
         };
-      }).sort((a, b) => parseFloat(b.spend.replace("$", "")) - parseFloat(a.spend.replace("$", "")));
+      }).sort((a, b) => parseFloat(b.spend.replace("$","")) - parseFloat(a.spend.replace("$","")));
       return { content: [{ type: "text", text: JSON.stringify({ days, placements: rows }, null, 2) }] };
     }
   );
@@ -397,42 +456,58 @@ function registerTools(s) {
     async ({ threshold, days }) => {
       const data = await metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
         fields: `name,status,insights{frequency,spend,reach}`,
-        ...insightsParams(dateRange(days)), limit: 100,
+        ...withAttribution(dateRange(days)), limit: 100,
         filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
       });
       const alerts = (data.data || [])
-        .map((a) => {
-          const ins = a.insights?.data?.[0];
-          return { id: a.id, name: a.name, frequency: parseFloat(ins?.frequency || 0), reach: ins?.reach || 0, spend: `$${parseFloat(ins?.spend || 0).toFixed(2)}` };
-        })
+        .map((a) => { const ins = a.insights?.data?.[0]; return { id: a.id, name: a.name, frequency: parseFloat(ins?.frequency || 0), reach: ins?.reach || 0, spend: `$${parseFloat(ins?.spend||0).toFixed(2)}` }; })
         .filter((a) => a.frequency >= threshold)
         .sort((a, b) => b.frequency - a.frequency);
       return { content: [{ type: "text", text: JSON.stringify({ threshold, days, count: alerts.length, adsets: alerts }, null, 2) }] };
     }
   );
 
-  // GET BUDGET PACING
+  // GET BUDGET PACING - FIX: by campaign breakdown
   s.tool(
     "get_budget_pacing",
     "Skolko byudzheta potracheno ot dnevnogo v % s uchetom vremeni sutok",
     {},
     async () => {
-      const data = await metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
-        fields: `name,status,daily_budget,insights{spend}`,
-        ...insightsParams(todayRange()), limit: 100,
-        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
-      });
+      // FIX: fetch both campaigns and adsets for full picture
+      const [campaignsData, adsetsData] = await Promise.all([
+        metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, {
+          fields: `name,status,daily_budget,insights{spend}`,
+          ...withAttribution(todayRange()), limit: 100,
+          filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+        }),
+        metaGet(`/act_${META_ACCOUNT_ID}/adsets`, {
+          fields: `name,status,daily_budget,campaign{name},insights{spend}`,
+          ...withAttribution(todayRange()), limit: 100,
+          filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+        }),
+      ]);
       const now = new Date();
       const dayPct = ((now.getHours() * 60 + now.getMinutes()) / 1440 * 100).toFixed(1);
-      const pacing = (data.data || []).filter((a) => a.daily_budget).map((a) => {
-        const budget = parseFloat(a.daily_budget) / 100;
-        const spent = parseFloat(a.insights?.data?.[0]?.spend || 0);
+
+      const calcPace = (budget_cents, ins) => {
+        if (!budget_cents) return null;
+        const budget = parseFloat(budget_cents) / 100;
+        const spent = parseFloat(ins?.data?.[0]?.spend || 0);
         const spentPct = (spent / budget * 100).toFixed(1);
         const diff = parseFloat(spentPct) - parseFloat(dayPct);
-        const pace = diff < -20 ? "MEDLENNO" : diff > 20 ? "BYSTRO (zakonchitsya ranshe)" : "NORMA";
-        return { name: a.name, budget: `$${budget.toFixed(2)}`, spent: `$${spent.toFixed(2)}`, spent_pct: `${spentPct}%`, day_passed_pct: `${dayPct}%`, pace };
-      });
-      return { content: [{ type: "text", text: JSON.stringify({ time: now.toTimeString().slice(0, 5), day_passed: `${dayPct}%`, adsets: pacing }, null, 2) }] };
+        const pace = diff < -20 ? "MEDLENNO" : diff > 20 ? "BYSTRO" : "NORMA";
+        return { budget: `$${budget.toFixed(2)}`, spent: `$${spent.toFixed(2)}`, spent_pct: `${spentPct}%`, pace };
+      };
+
+      const campaigns = (campaignsData.data || [])
+        .map((c) => ({ name: c.name, ...calcPace(c.daily_budget, c.insights) }))
+        .filter((c) => c.budget);
+
+      const adsets = (adsetsData.data || [])
+        .map((a) => ({ name: a.name, campaign: a.campaign?.name, ...calcPace(a.daily_budget, a.insights) }))
+        .filter((a) => a.budget);
+
+      return { content: [{ type: "text", text: JSON.stringify({ time: now.toTimeString().slice(0,5), day_passed: `${dayPct}%`, campaigns, adsets }, null, 2) }] };
     }
   );
 
@@ -448,8 +523,8 @@ function registerTools(s) {
     },
     async ({ max_cpp, min_ctr, max_frequency, spend_no_conv }) => {
       const [adsetsData, adsData] = await Promise.all([
-        metaGet(`/act_${META_ACCOUNT_ID}/adsets`, { fields: `name,status,insights{spend,ctr,frequency,actions}`, ...insightsParams(todayRange()), limit: 100, filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]) }),
-        metaGet(`/act_${META_ACCOUNT_ID}/ads`, { fields: `name,status,insights{spend,ctr,actions}`, ...insightsParams(todayRange()), limit: 100, filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/adsets`, { fields: `name,status,insights{spend,ctr,frequency,actions}`, ...withAttribution(todayRange()), limit: 100, filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/ads`, { fields: `name,status,campaign{name},insights{spend,ctr,actions}`, ...withAttribution(todayRange()), limit: 100, filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]) }),
       ]);
       const alerts = [];
       for (const a of adsetsData.data || []) {
@@ -459,58 +534,66 @@ function registerTools(s) {
         const freq = parseFloat(ins?.frequency || 0);
         const purchases = parseInt(ins?.actions?.find((x) => x.action_type === "purchase")?.value || 0);
         const cpp = purchases > 0 ? spend / purchases : null;
-        if (spend >= spend_no_conv && purchases === 0) alerts.push({ type: "NET_KONVERSIY", object: "adset", name: a.name, details: `$${spend.toFixed(2)} potracheno, 0 pokupok` });
+        if (spend >= spend_no_conv && purchases === 0) alerts.push({ type: "NET_KONVERSIY", object: "adset", name: a.name, details: `$${spend.toFixed(2)} bez pokupok` });
         if (cpp && cpp > max_cpp) alerts.push({ type: "VYSOKIY_CPP", object: "adset", name: a.name, details: `CPP $${cpp.toFixed(2)} > $${max_cpp}` });
         if (spend > 2 && ctr < min_ctr) alerts.push({ type: "NIZKIY_CTR", object: "adset", name: a.name, details: `CTR ${ctr.toFixed(2)}% < ${min_ctr}%` });
-        if (freq > max_frequency) alerts.push({ type: "VYSOKAYA_CHASTOTA", object: "adset", name: a.name, details: `Frequency ${freq.toFixed(2)} > ${max_frequency}` });
+        if (freq > max_frequency) alerts.push({ type: "VYSOKAYA_CHASTOTA", object: "adset", name: a.name, details: `freq ${freq.toFixed(2)} > ${max_frequency}` });
       }
       for (const a of adsData.data || []) {
         const ins = a.insights?.data?.[0];
         const spend = parseFloat(ins?.spend || 0);
         const purchases = parseInt(ins?.actions?.find((x) => x.action_type === "purchase")?.value || 0);
-        if (spend >= spend_no_conv && purchases === 0) alerts.push({ type: "NET_KONVERSIY", object: "ad", name: a.name, details: `$${spend.toFixed(2)} bez pokupok - vyklyuchit` });
+        if (spend >= spend_no_conv && purchases === 0) alerts.push({ type: "NET_KONVERSIY", object: "ad", name: a.name, campaign: a.campaign?.name, details: `$${spend.toFixed(2)} bez pokupok` });
       }
-      return { content: [{ type: "text", text: JSON.stringify({ time: new Date().toTimeString().slice(0, 5), total_alerts: alerts.length, alerts }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ time: new Date().toTimeString().slice(0,5), total: alerts.length, alerts }, null, 2) }] };
     }
   );
 
-  // GET DAILY SUMMARY
+  // GET DAILY SUMMARY - FIX: per-campaign breakdown
   s.tool(
     "get_daily_summary",
     "Itog dnya: rashod / pokupki / ROAS / luchshiy kreo / chto vyklyuchit",
     {},
     async () => {
-      const [accToday, accYest, adsToday] = await Promise.all([
-        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...insightsParams(todayRange()) }),
-        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...insightsParams(yesterdayRange()) }),
-        metaGet(`/act_${META_ACCOUNT_ID}/ads`, { fields: `name,status,creative{title,body},insights{${INSIGHTS_FIELDS}}`, ...insightsParams(todayRange()), limit: 100 }),
+      const [accToday, accYest, campaignsToday, adsToday] = await Promise.all([
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...withAttribution(todayRange()) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/insights`, { fields: INSIGHTS_FIELDS, level: "account", ...withAttribution(yesterdayRange()) }),
+        // FIX: per-campaign breakdown
+        metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, { fields: `name,status,insights{${INSIGHTS_FIELDS}}`, ...withAttribution(todayRange()), limit: 50, filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]) }),
+        metaGet(`/act_${META_ACCOUNT_ID}/ads`, { fields: `name,status,campaign{name},creative{body},insights{${INSIGHTS_FIELDS}}`, ...withAttribution(todayRange()), limit: 100 }),
       ]);
       const today = parsePurchases(accToday.data?.[0]);
       const yest = parsePurchases(accYest.data?.[0]);
       const tIns = accToday.data?.[0] || {};
       const yIns = accYest.data?.[0] || {};
+
+      const campaigns = (campaignsToday.data || []).map((c) => {
+        const ins = c.insights?.data?.[0];
+        const { purchases, cpp, roas } = parsePurchases(ins);
+        return { name: c.name, spend: `$${parseFloat(ins?.spend||0).toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net", roas: roas ? `${roas}x` : null };
+      });
+
       const ads = (adsToday.data || []).map((a) => {
         const ins = a.insights?.data?.[0];
         const { purchases, cpp } = parsePurchases(ins);
         const spend = parseFloat(ins?.spend || 0);
-        return { name: a.name, spend, purchases, cpp: cpp ? parseFloat(cpp) : null };
+        return { name: a.name, campaign: a.campaign?.name, spend, purchases, cpp: cpp ? parseFloat(cpp) : null };
       });
-      const winner = ads.filter((a) => a.purchases > 0).sort((a, b) => (a.cpp || 99) - (b.cpp || 99))[0];
+
+      const winner = ads.filter((a) => a.purchases > 0).sort((a, b) => (a.cpp||99) - (b.cpp||99))[0];
       const toKill = ads.filter((a) => a.spend >= 4 && a.purchases === 0);
-      const spendToday = parseFloat(tIns.spend || 0);
-      const spendYest = parseFloat(yIns.spend || 0);
+      const spendT = parseFloat(tIns.spend||0), spendY = parseFloat(yIns.spend||0);
+
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            date: fmtDate(new Date()),
-            segodnya: { spend: `$${spendToday.toFixed(2)}`, purchases: today.purchases, cpp: today.cpp ? `$${today.cpp}` : "net", roas: today.roas ? `${today.roas}x` : null, ctr: tIns.ctr ? `${parseFloat(tIns.ctr).toFixed(2)}%` : "0%" },
-            vs_vchera: { purchases: `${today.purchases - yest.purchases >= 0 ? "+" : ""}${today.purchases - yest.purchases}`, spend: `${spendToday - spendYest >= 0 ? "+" : ""}$${(spendToday - spendYest).toFixed(2)}` },
-            luchshiy_kreo: winner ? { name: winner.name, purchases: winner.purchases, cpp: `$${winner.cpp.toFixed(2)}` } : "net konversiy segodnya",
-            vyklyuchit: toKill.map((a) => ({ name: a.name, spend: `$${a.spend.toFixed(2)}`, reason: "$4+ bez pokupok" })),
-            itog: toKill.length > 0 ? `${toKill.length} obyavleniy nuzhno vyklyuchit` : "Vse v poryadke",
-          }, null, 2),
-        }],
+        content: [{ type: "text", text: JSON.stringify({
+          date: fmtDate(new Date()),
+          segodnya: { spend: `$${spendT.toFixed(2)}`, purchases: today.purchases, cpp: today.cpp ? `$${today.cpp}` : "net", roas: today.roas ? `${today.roas}x` : null, ctr: tIns.ctr ? `${parseFloat(tIns.ctr).toFixed(2)}%` : "0%" },
+          vs_vchera: { purchases: `${today.purchases-yest.purchases>=0?"+":""}${today.purchases-yest.purchases}`, spend: `${spendT-spendY>=0?"+":""}$${(spendT-spendY).toFixed(2)}` },
+          po_kampaniyam: campaigns,
+          luchshiy_kreo: winner ? { name: winner.name, campaign: winner.campaign, purchases: winner.purchases, cpp: `$${winner.cpp.toFixed(2)}` } : "net konversiy segodnya",
+          vyklyuchit: toKill.map((a) => ({ name: a.name, campaign: a.campaign, spend: `$${a.spend.toFixed(2)}`, reason: "$4+ bez pokupok" })),
+          itog: toKill.length > 0 ? `${toKill.length} obyavleniy nuzhno vyklyuchit` : "Vse v poryadke",
+        }, null, 2) }],
       };
     }
   );
@@ -519,11 +602,7 @@ function registerTools(s) {
   s.tool(
     "toggle_status",
     "Vklyuchit / vyklyuchit kampaniyu, adset ili obyavlenie",
-    {
-      entity_type: z.enum(["campaign", "adset", "ad"]),
-      entity_id: z.string(),
-      status: z.enum(["ACTIVE", "PAUSED"]),
-    },
+    { entity_type: z.enum(["campaign", "adset", "ad"]), entity_id: z.string(), status: z.enum(["ACTIVE", "PAUSED"]) },
     async ({ entity_type, entity_id, status }) => {
       await metaPost(`/${entity_id}`, { status });
       return { content: [{ type: "text", text: `OK: ${entity_type} ${entity_id} -> ${status}` }] };
@@ -537,17 +616,28 @@ function registerTools(s) {
     {
       entity_type: z.enum(["campaign", "adset"]),
       entity_id: z.string(),
-      budget: z.number().min(100).describe("Byudzhet v kopeykakh (500 = $5, 1500 = $15)"),
+      budget: z.number().min(100).describe("Byudzhet v kopeykakh (500=$5, 1500=$15)"),
       is_lifetime: z.boolean().default(false),
     },
     async ({ entity_type, entity_id, budget, is_lifetime }) => {
       const body = is_lifetime ? { lifetime_budget: budget } : { daily_budget: budget };
       await metaPost(`/${entity_id}`, body);
-      return { content: [{ type: "text", text: `OK: ${entity_type} ${entity_id} budget -> $${(budget / 100).toFixed(2)} (${is_lifetime ? "lifetime" : "daily"})` }] };
+      return { content: [{ type: "text", text: `OK: ${entity_type} ${entity_id} budget -> $${(budget/100).toFixed(2)} (${is_lifetime?"lifetime":"daily"})` }] };
     }
   );
 
-  // CREATE CAMPAIGN
+  // SET BID CAP
+  s.tool(
+    "set_bid_cap",
+    "Postavit ogranichenie stavki na adset",
+    { adset_id: z.string(), bid_cap_usd: z.number() },
+    async ({ adset_id, bid_cap_usd }) => {
+      await metaPost(`/${adset_id}`, { bid_amount: Math.round(bid_cap_usd * 100), bid_strategy: "LOWEST_COST_WITH_BID_CAP" });
+      return { content: [{ type: "text", text: `OK: bid cap ${adset_id} = $${bid_cap_usd}` }] };
+    }
+  );
+
+  // CREATE CAMPAIGN - FIX: special_ad_categories always included
   s.tool(
     "create_campaign",
     "Sozdat kampaniyu s nulya",
@@ -565,7 +655,7 @@ function registerTools(s) {
     }
   );
 
-  // CREATE ADSET
+  // CREATE ADSET - FIX: promoted_object always included
   s.tool(
     "create_adset",
     "Sozdat novyy adset s polnymi nastroyki targetinga",
@@ -577,28 +667,25 @@ function registerTools(s) {
       pixel_id: z.string().optional(),
       countries: z.array(z.string()).default(["UA"]),
       excluded_countries: z.array(z.string()).default([]),
-      languages: z.array(z.number()).default([]),
+      languages: z.array(z.number()).default([]).describe("32=ukr, 8=rus, 6=eng"),
       age_min: z.number().default(18),
       age_max: z.number().default(65),
-      genders: z.array(z.number()).default([]),
+      genders: z.array(z.number()).default([]).describe("1=male, 2=female, []=all"),
       status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
-      start_time: z.string().optional(),
+      start_time: z.string().optional().describe("ISO datetime, e.g. 2025-01-15T11:00:00+0200"),
     },
     async ({ name, campaign_id, daily_budget_usd, optimization_goal, pixel_id, countries, excluded_countries, languages, age_min, age_max, genders, status, start_time }) => {
       const geo_locations = countries.includes("WORLDWIDE")
         ? { location_types: ["home", "recent"] }
         : { countries };
       if (excluded_countries.length) geo_locations.excluded_countries = excluded_countries;
-
       const targeting = { age_min, age_max, geo_locations };
       if (languages.length) targeting.locales = languages;
       if (genders.length) targeting.genders = genders;
-
       const body = {
         name, campaign_id, status,
         daily_budget: Math.round(daily_budget_usd * 100),
-        optimization_goal,
-        billing_event: "IMPRESSIONS",
+        optimization_goal, billing_event: "IMPRESSIONS",
         targeting,
         ...promotedObject(pixel_id),
         ...(start_time && { start_time }),
@@ -608,7 +695,7 @@ function registerTools(s) {
     }
   );
 
-  // DUPLICATE ADSET
+  // DUPLICATE ADSET - FIX: CBO compatible + geo/language patch
   s.tool(
     "duplicate_adset",
     "Dublirovat adset dlya masshtabirovaniya ili smeny geo",
@@ -621,13 +708,12 @@ function registerTools(s) {
       status_after: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
     },
     async ({ adset_id, new_name, new_budget_usd, new_countries, new_languages, status_after }) => {
-      const body = { deep_copy: true, status_option: status_after };
-      if (new_budget_usd) body.daily_budget = Math.round(new_budget_usd * 100);
-
-      const d = await metaPost(`/${adset_id}/copies`, body);
+      // FIX: for CBO campaigns daily_budget on adset copy may be ignored - copy first then patch
+      const copyBody = { deep_copy: true, status_option: status_after };
+      if (new_budget_usd) copyBody.daily_budget = Math.round(new_budget_usd * 100);
+      const d = await metaPost(`/${adset_id}/copies`, copyBody);
       const newId = d.copied_adset_id;
 
-      // Apply geo/language/name changes if needed
       if (newId && (new_countries || new_languages || new_name)) {
         const current = await metaGet(`/${newId}`, { fields: "targeting,name" });
         const updates = {};
@@ -635,13 +721,12 @@ function registerTools(s) {
         if (new_countries || new_languages) {
           const targeting = { ...current.targeting };
           if (new_countries) targeting.geo_locations = new_countries.includes("WORLDWIDE") ? { location_types: ["home", "recent"] } : { countries: new_countries };
-          if (new_languages) targeting.locales = new_languages.length ? new_languages : undefined;
+          if (new_languages !== undefined) targeting.locales = new_languages.length ? new_languages : undefined;
           updates.targeting = targeting;
         }
         await metaPost(`/${newId}`, updates);
       }
-
-      return { content: [{ type: "text", text: JSON.stringify({ success: true, new_adset_id: newId, status: status_after, changes: { new_name, new_budget_usd, new_countries, new_languages } }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ success: true, new_adset_id: newId, status: status_after }, null, 2) }] };
     }
   );
 
@@ -678,10 +763,7 @@ function registerTools(s) {
   s.tool(
     "upload_image",
     "Zagruzit izobrazhenie po URL v biblioteku reklamnogo akkaunta",
-    {
-      image_url: z.string(),
-      name: z.string().optional(),
-    },
+    { image_url: z.string(), name: z.string().optional() },
     async ({ image_url, name }) => {
       const body = { url: image_url };
       if (name) body.name = name;
@@ -698,7 +780,7 @@ function registerTools(s) {
     {
       name: z.string(),
       adset_id: z.string(),
-      page_id: z.string().optional().describe("Facebook Page ID (esli ne ukazan - iz ENV)"),
+      page_id: z.string().optional().describe("Facebook Page ID (esli ne ukazan - iz ENV META_PAGE_ID)"),
       primary_text: z.string(),
       headline: z.string().optional(),
       description: z.string().optional(),
@@ -711,8 +793,7 @@ function registerTools(s) {
     async ({ name, adset_id, page_id, primary_text, headline, description, link_url, image_hash, video_id, call_to_action, status }) => {
       const pid = page_id || META_PAGE_ID;
       const link_data = {
-        message: primary_text,
-        link: link_url,
+        message: primary_text, link: link_url,
         call_to_action: { type: call_to_action, value: { link: link_url } },
         ...(headline && { name: headline }),
         ...(description && { description }),
@@ -747,20 +828,6 @@ function registerTools(s) {
     }
   );
 
-  // SET BID CAP
-  s.tool(
-    "set_bid_cap",
-    "Postavit ogranichenie stavki na adset",
-    {
-      adset_id: z.string(),
-      bid_cap_usd: z.number(),
-    },
-    async ({ adset_id, bid_cap_usd }) => {
-      await metaPost(`/${adset_id}`, { bid_amount: Math.round(bid_cap_usd * 100), bid_strategy: "LOWEST_COST_WITH_BID_CAP" });
-      return { content: [{ type: "text", text: `OK: bid cap adset ${adset_id} = $${bid_cap_usd}` }] };
-    }
-  );
-
   // GET AB TEST RESULTS
   s.tool(
     "get_ab_test_results",
@@ -773,11 +840,8 @@ function registerTools(s) {
     },
     async ({ id_a, id_b, days }) => {
       const fields = `name,status,insights{${INSIGHTS_FIELDS}}`;
-      const params = insightsParams(dateRange(days));
-      const [a, b] = await Promise.all([
-        metaGet(`/${id_a}`, { fields, ...params }),
-        metaGet(`/${id_b}`, { fields, ...params }),
-      ]);
+      const params = withAttribution(dateRange(days));
+      const [a, b] = await Promise.all([metaGet(`/${id_a}`, { fields, ...params }), metaGet(`/${id_b}`, { fields, ...params })]);
       const parse = (obj) => {
         const ins = obj.insights?.data?.[0];
         const { purchases, cpp, roas } = parsePurchases(ins);
@@ -786,24 +850,21 @@ function registerTools(s) {
       };
       const ra = parse(a), rb = parse(b);
       const winner = ra._cpp && rb._cpp ? (ra._cpp < rb._cpp ? "A" : "B") : ra._purchases > rb._purchases ? "A" : rb._purchases > ra._purchases ? "B" : "net dannyh";
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ days, A: ra, B: rb, winner, recommendation: winner !== "net dannyh" ? `Masshtabirovat ${winner}, vyklyuchit ${winner === "A" ? "B" : "A"} esli raznica stabilna 3+ dnya` : "Nedostatochno dannyh - zhdat minimum 3 dnya" }, null, 2),
-        }],
-      };
+      return { content: [{ type: "text", text: JSON.stringify({ days, A: ra, B: rb, winner, recommendation: winner !== "net dannyh" ? `Masshtabirovat ${winner}, vyklyuchit ${winner==="A"?"B":"A"} esli stabilno 3+ dnya` : "Nedostatochno dannyh" }, null, 2) }] };
     }
   );
 
-  // GET WINNER RECOMMENDATION
+  // GET WINNER RECOMMENDATION - FIX: only active ads
   s.tool(
     "get_winner_recommendation",
     "Avtovyvod pobeditelya sredi vsekh aktivnykh kreo",
     { days: z.number().default(7), min_spend_usd: z.number().default(3) },
     async ({ days, min_spend_usd }) => {
       const data = await metaGet(`/act_${META_ACCOUNT_ID}/ads`, {
-        fields: `name,status,insights{${INSIGHTS_FIELDS}}`,
-        ...insightsParams(dateRange(days)), limit: 100,
+        fields: `name,status,campaign{name},insights{${INSIGHTS_FIELDS}}`,
+        ...withAttribution(dateRange(days)), limit: 100,
+        // FIX: filter only ACTIVE
+        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
       });
       const ads = (data.data || [])
         .map((a) => {
@@ -820,43 +881,13 @@ function registerTools(s) {
             else if (freq > 3) action = "auditoriya vygoraet";
             else if (purchases > 0) action = "nablyudat 1-2 dnya";
           }
-          return { name: a.name, spend: `$${spend.toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net", ctr: `${ctr.toFixed(2)}%`, frequency: freq.toFixed(2), action, _purchases: purchases, _cpp: cpp ? parseFloat(cpp) : 99, _spend: spend };
+          return { name: a.name, campaign: a.campaign?.name, spend: `$${spend.toFixed(2)}`, purchases, cpp: cpp ? `$${cpp}` : "net", roas: roas ? `${roas}x` : null, ctr: `${ctr.toFixed(2)}%`, freq: freq.toFixed(2), action, _p: purchases, _cpp: cpp ? parseFloat(cpp) : 99, _s: spend };
         })
-        .filter((a) => a._spend >= min_spend_usd)
-        .sort((a, b) => b._purchases - a._purchases || a._cpp - b._cpp);
+        .filter((a) => a._s >= min_spend_usd)
+        .sort((a, b) => b._p - a._p || a._cpp - b._cpp);
 
-      const winner = ads.find((a) => a._purchases >= 2 && a._cpp <= 5);
-      return { content: [{ type: "text", text: JSON.stringify({ days, winner: winner ? { name: winner.name, cpp: winner.cpp, purchases: winner.purchases } : "ne opredelen", all_ads: ads }, null, 2) }] };
-    }
-  );
-
-  // GET ACCOUNT LIMITS
-  s.tool(
-    "get_account_limits",
-    "Proverit limity akkaunta: spend-limit, ostatok, status",
-    {},
-    async () => {
-      const data = await metaGet(`/act_${META_ACCOUNT_ID}`, {
-        fields: "name,account_status,currency,spend_cap,amount_spent,balance,disable_reason,timezone_name",
-      });
-      const statusMap = { 1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW", 9: "IN_GRACE_PERIOD", 101: "TEMP_DISABLED" };
-      const spent = parseFloat(data.amount_spent || 0) / 100;
-      const cap = data.spend_cap ? parseFloat(data.spend_cap) / 100 : null;
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            account: data.name,
-            status: statusMap[data.account_status] || data.account_status,
-            currency: data.currency,
-            spent_total: `$${spent.toFixed(2)}`,
-            spend_cap: cap ? `$${cap.toFixed(2)}` : "ne ustanovlen",
-            remaining: cap ? `$${(cap - spent).toFixed(2)}` : "unlimited",
-            balance: data.balance ? `$${(parseFloat(data.balance) / 100).toFixed(2)}` : null,
-            timezone: data.timezone_name,
-          }, null, 2),
-        }],
-      };
+      const winner = ads.find((a) => a._p >= 2 && a._cpp <= 5);
+      return { content: [{ type: "text", text: JSON.stringify({ days, min_spend: `$${min_spend_usd}`, winner: winner ? { name: winner.name, campaign: winner.campaign, cpp: winner.cpp, purchases: winner.purchases } : "ne opredelen", all_active_ads: ads }, null, 2) }] };
     }
   );
 
@@ -864,30 +895,24 @@ function registerTools(s) {
   s.tool(
     "pause_all_emergency",
     "EKSTRENNAYA OSTANOVKA - postavit vse aktivnye kampanii na pauzu",
-    { confirm: z.boolean().describe("Obyazatelno true dlya vypolneniya") },
+    { confirm: z.boolean() },
     async ({ confirm }) => {
-      if (!confirm) return { content: [{ type: "text", text: "Ne vypolneno. Pereday confirm: true dlya podtverzhdeniya." }] };
-      const data = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, {
-        fields: "id,name,status",
-        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
-        limit: 100,
-      });
+      if (!confirm) return { content: [{ type: "text", text: "Ne vypolneno. Pereday confirm: true" }] };
+      const data = await metaGet(`/act_${META_ACCOUNT_ID}/campaigns`, { fields: "id,name", filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]), limit: 100 });
       const results = [];
-      for (const c of data.data || []) {
-        await metaPost(`/${c.id}`, { status: "PAUSED" });
-        results.push(c.name);
-      }
-      return { content: [{ type: "text", text: JSON.stringify({ status: "VSE KAMPANII OSTANOVLENY", count: results.length, campaigns: results }, null, 2) }] };
+      for (const c of data.data || []) { await metaPost(`/${c.id}`, { status: "PAUSED" }); results.push(c.name); }
+      return { content: [{ type: "text", text: JSON.stringify({ status: "VSE_OSTANOVLENY", count: results.length, campaigns: results }, null, 2) }] };
     }
   );
 }
 
-// EXPRESS
+// -- Express -------------------------------------------------------------------
+// NOTE: NO global express.json() - breaks handlePostMessage (reads raw stream)
 const app = express();
 const transports = new Map();
 
-app.get("/", (req, res) => res.send("FB Ads MCP Server v3.1.0"));
-app.get("/health", (req, res) => res.json({ status: "ok", account: META_ACCOUNT_ID ? "connected" : "no token" }));
+app.get("/", (req, res) => res.send("FB Ads MCP v3.2.0"));
+app.get("/health", (req, res) => res.json({ status: "ok", account: META_ACCOUNT_ID ? "set" : "missing" }));
 
 app.get("/sse", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
@@ -898,36 +923,25 @@ app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports.set(transport.sessionId, transport);
 
-  const mcpServer = new McpServer({ name: "fb-ads-mcp", version: "3.1.0" });
+  const mcpServer = new McpServer({ name: "fb-ads-mcp", version: "3.2.0" });
   registerTools(mcpServer);
 
-  res.on("close", () => {
-    transports.delete(transport.sessionId);
-    mcpServer.close().catch(() => {});
-  });
+  res.on("close", () => { transports.delete(transport.sessionId); mcpServer.close().catch(() => {}); });
 
   await mcpServer.connect(transport);
   console.log(`Connected [${transport.sessionId}]`);
 
-  const keepalive = setInterval(() => {
-    if (!res.writableEnded) res.write(": ping\n\n");
-  }, 25000);
+  const keepalive = setInterval(() => { if (!res.writableEnded) res.write(": ping\n\n"); }, 25000);
   res.on("close", () => clearInterval(keepalive));
 });
 
 app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports.get(sessionId);
+  const transport = transports.get(req.query.sessionId);
   if (!transport) return res.status(404).json({ error: "Session not found" });
-  try {
-    await transport.handlePostMessage(req, res);
-  } catch (e) {
-    console.error("Message error:", e);
-    res.status(500).json({ error: e.message });
-  }
+  try { await transport.handlePostMessage(req, res); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`FB Ads MCP v3.1.0 on port ${PORT}`);
-  console.log(`Account: act_${META_ACCOUNT_ID}`);
+  console.log(`FB Ads MCP v3.2.0 port ${PORT} account act_${META_ACCOUNT_ID}`);
 });
