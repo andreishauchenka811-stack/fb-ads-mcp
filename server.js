@@ -43,7 +43,11 @@ async function metaGet(path, params = {}) {
   const qs = new URLSearchParams({ access_token: META_TOKEN, ...params });
   const r = await fetch(`${BASE}${path}?${qs}`);
   const d = await r.json();
-  if (d.error) throw new Error(`Meta API: ${d.error.message}`);
+  if (d.error) {
+    console.error("FB API Error [GET]", path, JSON.stringify(d.error));
+    const e = d.error;
+    throw new Error(`FB API ${e.code}/${e.error_subcode || 0}: ${e.message}${e.error_user_msg ? " | " + e.error_user_msg : ""} (fbtrace_id: ${e.fbtrace_id})`);
+  }
   return d;
 }
 
@@ -54,7 +58,12 @@ async function metaPost(path, body = {}) {
     body: JSON.stringify({ access_token: META_TOKEN, ...body }),
   });
   const d = await r.json();
-  if (d.error) throw new Error(`Meta API: ${d.error.message}`);
+  if (d.error) {
+    console.error("FB API Error [POST]", path, JSON.stringify(d.error));
+    console.error("FB API Request body:", JSON.stringify({ ...body, access_token: "***" }));
+    const e = d.error;
+    throw new Error(`FB API ${e.code}/${e.error_subcode || 0}: ${e.message}${e.error_user_msg ? " | " + e.error_user_msg : ""} (fbtrace_id: ${e.fbtrace_id})`);
+  }
   return d;
 }
 
