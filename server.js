@@ -564,6 +564,7 @@ function registerTools(s) {
           location_types: ["home", "recent"],
         },
         ...(excluded_countries && excluded_countries.length ? { excluded_geo_locations: { countries: excluded_countries } } : {}),
+        targeting_automation: { advantage_audience: advantage_audience ?? 0 },
       };
       const body = {
         name, campaign_id, status,
@@ -571,7 +572,6 @@ function registerTools(s) {
         optimization_goal,
         billing_event: "IMPRESSIONS",
         targeting,
-        targeting_automation: { advantage_audience: advantage_audience ?? 0 },
         ...(pid ? { promoted_object: { pixel_id: pid, custom_event_type: "PURCHASE" } } : {}),
         attribution_spec: [
           { event_type: "CLICK_THROUGH",      window_days: 7 },
