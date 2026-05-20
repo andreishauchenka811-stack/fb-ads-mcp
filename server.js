@@ -558,13 +558,13 @@ function registerTools(s) {
 
   // DUPLICATE ADSET
   s.tool("duplicate_adset", "Dublirovat adset dlya masshtabirovaniya ili smeny geo",
-    { adset_id:z.string(), new_name:z.string().optional(), new_budget_usd:z.number().optional(), new_countries:z.array(z.string()).optional(), new_languages:z.array(z.number()).optional(), status_after:z.enum(["ACTIVE","PAUSED"]).default("PAUSED") },
-    async ({ adset_id, new_name, new_budget_usd, new_countries, new_languages, status_after }) => {
+    { adset_id:z.string(), new_name:z.string().optional(), new_budget_usd:z.number().optional(), new_countries:z.array(z.string()).optional(), new_languages:z.array(z.number()).optional(), pixel_id:z.string().optional().describe("Pereopredelet piksel. Esli ne ukazat — budet skopirovan iz originala"), status_after:z.enum(["ACTIVE","PAUSED"]).default("PAUSED"), account:ACCT_PARAM },
+    async ({ adset_id, new_name, new_budget_usd, new_countries, new_languages, pixel_id, status_after, account }) => {
       const copyBody = { deep_copy:true, status_option:status_after };
       if (new_budget_usd) copyBody.daily_budget = Math.round(new_budget_usd*100);
       const d = await metaPost(`/${adset_id}/copies`, copyBody);
       const newId = d.copied_adset_id;
-      if (newId && (new_countries||new_languages||new_name)) {
+      if (newId && (new_countries||new_languages||new_name||pixel_id)) {
         const current = await metaGet(`/${newId}`, { fields:"targeting,name" });
         const updates = {};
         if (new_name) updates.name = new_name;
@@ -574,6 +574,8 @@ function registerTools(s) {
           if (new_languages!==undefined) targeting.locales = new_languages.length ? new_languages : undefined;
           updates.targeting = targeting;
         }
+        const pid = pixel_id || resolvePix(account);
+        if (pid) Object.assign(updates, promotedObject(pid));
         await metaPost(`/${newId}`, updates);
       }
       return { content: [{ type:"text", text:JSON.stringify({ success:true, new_adset_id:newId, status:status_after }, null, 2) }] };
