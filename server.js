@@ -133,15 +133,6 @@ function registerTools(s) {
     content: [{ type: "text", text: "FB Ads MCP v4.0.0 — multi-account OK" }],
   }));
 
-  s.tool("get_adset_raw", "Poluchit polnuyu syruyu strukturu adseta dlya diagnostiki",
-    { adset_id: z.string() },
-    async ({ adset_id }) => {
-      const data = await metaGet(`/${adset_id}`, {
-        fields: "name,status,targeting,targeting_automation,bid_strategy,attribution_spec,optimization_goal,billing_event,promoted_object,daily_budget,campaign_id",
-      });
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-  );
 
   // GET ACCOUNT LIMITS
   s.tool("get_account_limits", "Proverit limity akkaunta: spend-limit, ostatok, status",
