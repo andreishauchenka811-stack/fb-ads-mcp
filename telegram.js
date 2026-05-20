@@ -7,13 +7,14 @@ const CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
 const META_TOKEN = process.env.META_TOKEN;
 const BASE = "https://graph.facebook.com/v19.0";
 
-// Account map (same as server.js)
 const ACCOUNTS = {
   primary: process.env.META_ACCOUNT_ID,
   chizy:   process.env.ACCOUNT_ID_1 || process.env.META_ACCOUNT_ID,
   letniy:  process.env.ACCOUNT_ID_2 || process.env.META_ACCOUNT_ID,
   pp:      process.env.ACCOUNT_ID_3 || process.env.META_ACCOUNT_ID,
 };
+
+const CPP_ALERT = 8; // порог CPP в долларах
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
@@ -54,6 +55,31 @@ function parsePurchases(ins) {
   return { purchases, cpp, revenue, roas, spend };
 }
 
+function uniqueAccounts() {
+  const seen = new Set();
+  return Object.keys(ACCOUNTS).filter((k) => {
+    if (!ACCOUNTS[k] || seen.has(ACCOUNTS[k])) return false;
+    seen.add(ACCOUNTS[k]); return true;
+  });
+}
+
+// -- Inline keyboard --------------------------------------------------------
+
+const MENU_KEYBOARD = {
+  inline_keyboard: [
+    [
+      { text: "📊 Отчёт", callback_data: "report" },
+      { text: "⚠️ Алерты", callback_data: "alerts" },
+      { text: "📡 Статус", callback_data: "status" },
+    ],
+    [
+      { text: "📅 Сегодня", callback_data: "today" },
+      { text: "🏆 Топ", callback_data: "top" },
+      { text: "⏸ На паузе", callback_data: "paused" },
+    ],
+  ],
+};
+
 // -- Report builders --------------------------------------------------------
 
 async function buildDailyReport(accKey) {
@@ -65,16 +91,16 @@ async function buildDailyReport(accKey) {
   const td = parsePurchases(t.data?.[0]);
   const yd = parsePurchases(y.data?.[0]);
   const tIns = t.data?.[0] || {};
+  const cppWarn = td.cpp && parseFloat(td.cpp) > CPP_ALERT ? " 🔴" : "";
 
-  const lines = [
+  return [
     `📊 *${accKey.toUpperCase()}* | ${fmtDate(new Date())}`,
     `💰 Расход: *$${td.spend.toFixed(2)}* (вчера $${yd.spend.toFixed(2)})`,
     `🛒 Покупки: *${td.purchases}* (вчера ${yd.purchases})`,
-    `📈 CPP: *${td.cpp ? `$${td.cpp}` : "нет"}*`,
+    `📈 CPP: *${td.cpp ? `$${td.cpp}` : "нет"}*${cppWarn}`,
     `🔄 ROAS: *${td.roas ? `${td.roas}x` : "нет"}*`,
     `👁 CTR: ${tIns.ctr ? `${parseFloat(tIns.ctr).toFixed(2)}%` : "0%"}`,
-  ];
-  return lines.join("\n");
+  ].join("\n");
 }
 
 async function buildAlertsReport(accKey) {
@@ -95,79 +121,155 @@ async function buildAlertsReport(accKey) {
     const freq = parseFloat(ins?.frequency || 0);
     const purchases = parseInt(ins?.actions?.find((x) => x.action_type === "purchase")?.value || 0);
     const cpp = purchases > 0 ? spend / purchases : null;
-    if (spend >= 4 && purchases === 0) alerts.push(`🔴 NET_KONVERSIY: ${a.name} ($${spend.toFixed(2)})`);
-    if (cpp && cpp > 6) alerts.push(`🟡 VYSOKIY_CPP: ${a.name} — $${cpp.toFixed(2)}`);
-    if (freq > 2.5) alerts.push(`🟠 CHASTOTA: ${a.name} — ${freq.toFixed(2)}`);
-    if (spend > 2 && ctr < 0.5) alerts.push(`⚪ NIZKIY_CTR: ${a.name} — ${ctr.toFixed(2)}%`);
+    if (spend >= 4 && purchases === 0) alerts.push(`🔴 НЕТ КОНВЕРСИЙ: ${a.name} ($${spend.toFixed(2)})`);
+    if (cpp && cpp > CPP_ALERT) alerts.push(`🟡 ВЫСОКИЙ CPP: ${a.name} — $${cpp.toFixed(2)} > $${CPP_ALERT}`);
+    if (freq > 2.5) alerts.push(`🟠 ЧАСТОТА: ${a.name} — ${freq.toFixed(2)}`);
+    if (spend > 2 && ctr < 0.5) alerts.push(`⚪ НИЗКИЙ CTR: ${a.name} — ${ctr.toFixed(2)}%`);
   }
 
   if (alerts.length === 0) return `✅ *${accKey.toUpperCase()}* — алертов нет`;
   return `⚠️ *${accKey.toUpperCase()}* — ${alerts.length} алертов:\n` + alerts.join("\n");
 }
 
-// -- Send helper ------------------------------------------------------------
+async function buildTodayReport(accKey) {
+  const accId = ACCOUNTS[accKey] || ACCOUNTS.primary;
+  const data = await mGet(`/act_${accId}/campaigns`, {
+    fields: `name,status,insights{${F}}`,
+    time_range: todayRange().time_range,
+    action_attribution_windows: ATTR,
+    limit: 20,
+    filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+  });
 
-function send(text) {
-  return bot.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" }).catch((e) => console.error("TG send error:", e.message));
+  const campaigns = (data.data || []).map((c) => {
+    const ins = c.insights?.data?.[0];
+    const { purchases, cpp, spend } = parsePurchases(ins);
+    return { name: c.name, spend, purchases, cpp };
+  }).sort((a, b) => b.spend - a.spend);
+
+  const lines = [`📅 *${accKey.toUpperCase()}* сегодня по кампаниям:`];
+  for (const c of campaigns) {
+    const cppStr = c.cpp ? `$${c.cpp}` : "нет";
+    lines.push(`• ${c.name.substring(0, 30)}: $${c.spend.toFixed(2)} | ${c.purchases} 🛒 | CPP ${cppStr}`);
+  }
+  if (campaigns.length === 0) lines.push("Нет активных кампаний");
+  return lines.join("\n");
 }
 
-// -- Morning report cron — 9:00 Kyiv = 06:00 UTC summer / 07:00 UTC winter
-// Using 06:00 UTC (adjust if needed)
+async function buildTopReport(accKey) {
+  const accId = ACCOUNTS[accKey] || ACCOUNTS.primary;
+  const data = await mGet(`/act_${accId}/ads`, {
+    fields: `name,status,campaign{name},insights{${F}}`,
+    time_range: todayRange().time_range,
+    action_attribution_windows: ATTR,
+    limit: 100,
+    filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["ACTIVE"] }]),
+  });
+
+  const ads = (data.data || []).map((a) => {
+    const ins = a.insights?.data?.[0];
+    const { purchases, cpp, spend } = parsePurchases(ins);
+    return { name: a.name, campaign: a.campaign?.name, spend, purchases, cpp: cpp ? parseFloat(cpp) : null };
+  }).filter((a) => a.purchases > 0).sort((a, b) => (a.cpp || 99) - (b.cpp || 99)).slice(0, 5);
+
+  if (ads.length === 0) return `🏆 *${accKey.toUpperCase()}* — конверсий сегодня нет`;
+  const lines = [`🏆 *${accKey.toUpperCase()}* — топ объявлений:`];
+  ads.forEach((a, i) => {
+    lines.push(`${i + 1}. ${a.name.substring(0, 28)}\n   $${a.spend.toFixed(2)} | 🛒 ${a.purchases} | CPP $${a.cpp.toFixed(2)}`);
+  });
+  return lines.join("\n");
+}
+
+async function buildPausedReport(accKey) {
+  const accId = ACCOUNTS[accKey] || ACCOUNTS.primary;
+  const data = await mGet(`/act_${accId}/campaigns`, {
+    fields: "name,status,insights{spend}",
+    time_range: todayRange().time_range,
+    limit: 50,
+    filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["PAUSED"] }]),
+  });
+
+  const paused = (data.data || []).map((c) => {
+    const spend = parseFloat(c.insights?.data?.[0]?.spend || 0);
+    return { name: c.name, spend };
+  });
+
+  if (paused.length === 0) return `⏸ *${accKey.toUpperCase()}* — ничего на паузе`;
+  const lines = [`⏸ *${accKey.toUpperCase()}* — на паузе (${paused.length}):`];
+  paused.forEach((c) => lines.push(`• ${c.name.substring(0, 35)}${c.spend > 0 ? ` ($${c.spend.toFixed(2)} сегодня)` : ""}`));
+  return lines.join("\n");
+}
+
+// -- Send helpers -----------------------------------------------------------
+
+function send(text, withMenu = false) {
+  const opts = { parse_mode: "Markdown" };
+  if (withMenu) opts.reply_markup = MENU_KEYBOARD;
+  return bot.sendMessage(CHAT_ID, text, opts).catch((e) => console.error("TG send error:", e.message));
+}
+
+async function runForAllAccounts(builder, withMenu = false) {
+  const keys = uniqueAccounts();
+  for (const key of keys) {
+    try { await send(await builder(key), withMenu); }
+    catch (e) { await send(`❌ Ошибка ${key}: ${e.message}`, false); }
+  }
+}
+
+// -- Cron schedule (Kyiv summer UTC+3) -------------------------------------
+
+// 9:00 Kyiv = 06:00 UTC — утренний
 cron.schedule("0 6 * * *", async () => {
   console.log("[TG] Morning report");
-  const activeAccounts = Object.keys(ACCOUNTS).filter((k) => ACCOUNTS[k]);
-  const seen = new Set();
-  const unique = activeAccounts.filter((k) => { if (seen.has(ACCOUNTS[k])) return false; seen.add(ACCOUNTS[k]); return true; });
-  for (const key of unique) {
-    try {
-      const report = await buildDailyReport(key);
-      await send(report);
-    } catch (e) {
-      await send(`❌ Ошибка отчёта ${key}: ${e.message}`);
-    }
-  }
+  await send("🌅 *Утренний отчёт*", false);
+  await runForAllAccounts(buildDailyReport, true);
 });
 
-// -- Alert check every 30 min (8:00 - 22:00 UTC)
+// 14:00 Kyiv = 11:00 UTC — дневной
+cron.schedule("0 11 * * *", async () => {
+  console.log("[TG] Midday report");
+  await send("☀️ *Дневной срез*", false);
+  await runForAllAccounts(buildTodayReport, true);
+});
+
+// 21:00 Kyiv = 18:00 UTC — вечерний итог
+cron.schedule("0 18 * * *", async () => {
+  console.log("[TG] Evening report");
+  await send("🌙 *Итог дня*", false);
+  await runForAllAccounts(buildDailyReport, true);
+});
+
+// Алерты каждые 30 мин 8:00-22:00 UTC
 cron.schedule("*/30 8-22 * * *", async () => {
   console.log("[TG] Alert check");
-  const activeAccounts = Object.keys(ACCOUNTS).filter((k) => ACCOUNTS[k]);
-  const seen = new Set();
-  const unique = activeAccounts.filter((k) => { if (seen.has(ACCOUNTS[k])) return false; seen.add(ACCOUNTS[k]); return true; });
-  for (const key of unique) {
+  const keys = uniqueAccounts();
+  for (const key of keys) {
     try {
       const report = await buildAlertsReport(key);
-      if (report.startsWith("⚠️")) await send(report);
-    } catch (e) {
-      console.error(`[TG] Alert check error ${key}:`, e.message);
-    }
+      if (report.startsWith("⚠️")) await send(report, true);
+    } catch (e) { console.error(`[TG] Alert check error ${key}:`, e.message); }
   }
 });
 
 // -- Commands ---------------------------------------------------------------
 
-bot.onText(/\/start/, (msg) => {
-  send(`👋 FB Ads Manager v4.0.0\n\nКоманды:\n/report — сводка за сегодня\n/alerts — текущие алерты\n/status — быстрый статус\n\nТекстовые команды:\n• масштабируй [аккаунт] [id] [бюджет$]\n• выключи [кампания/адсет/объявление] [id]\n• включи [кампания/адсет/объявление] [id]`);
+bot.onText(/\/start/, () => {
+  send(
+    `👋 *FB Ads Manager v4.0.0*\n\nВыбери команду кнопкой ниже или введи вручную:\n/report — сводка по всем аккаунтам\n/alerts — текущие алерты (CPP > $${CPP_ALERT})\n/status — статус аккаунтов\n/today — сегодня по кампаниям\n/top — топ объявлений по CPP\n/paused — что на паузе\n/menu — показать кнопки`,
+    true
+  );
 });
 
+bot.onText(/\/menu/, () => send("📋 Меню:", true));
+
 bot.onText(/\/report/, async () => {
-  const activeAccounts = Object.keys(ACCOUNTS).filter((k) => ACCOUNTS[k]);
-  const seen = new Set();
-  const unique = activeAccounts.filter((k) => { if (seen.has(ACCOUNTS[k])) return false; seen.add(ACCOUNTS[k]); return true; });
-  for (const key of unique) {
-    try { await send(await buildDailyReport(key)); }
-    catch (e) { await send(`❌ Ошибка ${key}: ${e.message}`); }
-  }
+  await send("⏳ Загружаю...", false);
+  await runForAllAccounts(buildDailyReport, true);
 });
 
 bot.onText(/\/alerts/, async () => {
-  const activeAccounts = Object.keys(ACCOUNTS).filter((k) => ACCOUNTS[k]);
-  const seen = new Set();
-  const unique = activeAccounts.filter((k) => { if (seen.has(ACCOUNTS[k])) return false; seen.add(ACCOUNTS[k]); return true; });
-  for (const key of unique) {
-    try { await send(await buildAlertsReport(key)); }
-    catch (e) { await send(`❌ Ошибка ${key}: ${e.message}`); }
-  }
+  await send("⏳ Проверяю алерты...", false);
+  await runForAllAccounts(buildAlertsReport, true);
 });
 
 bot.onText(/\/status/, async () => {
@@ -179,43 +281,89 @@ bot.onText(/\/status/, async () => {
       lines.push(`• ${key}: ${info.name} — ${info.account_status === 1 ? "✅ ACTIVE" : "⚠️ " + info.account_status}`);
     } catch (e) { lines.push(`• ${key}: ❌ ${e.message}`); }
   }
-  await send(lines.join("\n"));
+  await send(lines.join("\n"), true);
 });
 
-// Text command: "масштабируй chizy 120000000000 15"
+bot.onText(/\/today/, async () => {
+  await send("⏳ Загружаю...", false);
+  await runForAllAccounts(buildTodayReport, true);
+});
+
+bot.onText(/\/top/, async () => {
+  await send("⏳ Загружаю...", false);
+  await runForAllAccounts(buildTopReport, true);
+});
+
+bot.onText(/\/paused/, async () => {
+  await send("⏳ Загружаю...", false);
+  await runForAllAccounts(buildPausedReport, true);
+});
+
+// -- Inline button callbacks ------------------------------------------------
+
+bot.on("callback_query", async (q) => {
+  await bot.answerCallbackQuery(q.id);
+  const action = q.data;
+
+  const handlers = {
+    report: () => runForAllAccounts(buildDailyReport, true),
+    alerts: () => runForAllAccounts(buildAlertsReport, true),
+    today:  () => runForAllAccounts(buildTodayReport, true),
+    top:    () => runForAllAccounts(buildTopReport, true),
+    paused: () => runForAllAccounts(buildPausedReport, true),
+    status: async () => {
+      const lines = ["📡 *Статус аккаунтов:*"];
+      for (const [key, id] of Object.entries(ACCOUNTS)) {
+        if (!id) continue;
+        try {
+          const info = await mGet(`/act_${id}`, { fields: "name,account_status" });
+          lines.push(`• ${key}: ${info.name} — ${info.account_status === 1 ? "✅ ACTIVE" : "⚠️ " + info.account_status}`);
+        } catch (e) { lines.push(`• ${key}: ❌ ${e.message}`); }
+      }
+      await send(lines.join("\n"), true);
+    },
+  };
+
+  if (handlers[action]) {
+    await send("⏳ Загружаю...", false);
+    try { await handlers[action](); }
+    catch (e) { await send(`❌ Ошибка: ${e.message}`, true); }
+  }
+});
+
+// -- Text commands ----------------------------------------------------------
+
 bot.on("message", async (msg) => {
+  if (msg.text?.startsWith("/")) return;
   const text = (msg.text || "").toLowerCase();
 
-  // Scale: масштабируй [account] [entity_id] [budget_usd]
   const scaleMatch = text.match(/масштабируй\s+(\w+)\s+(\d+)\s+([\d.]+)/);
   if (scaleMatch) {
     const [, accKey, entityId, budgetUsd] = scaleMatch;
     try {
       await mPost(`/${entityId}`, { daily_budget: Math.round(parseFloat(budgetUsd) * 100) });
-      await send(`✅ Бюджет ${entityId} (${accKey}) → $${budgetUsd}/день`);
-    } catch (e) { await send(`❌ Ошибка: ${e.message}`); }
+      await send(`✅ Бюджет ${entityId} (${accKey}) → $${budgetUsd}/день`, true);
+    } catch (e) { await send(`❌ Ошибка: ${e.message}`, true); }
     return;
   }
 
-  // Pause: выключи [type] [id]  OR  выключи [id]
   const pauseMatch = text.match(/выключи\s+(?:(\w+)\s+)?(\d+)/);
   if (pauseMatch) {
     const entityId = pauseMatch[2];
     try {
       await mPost(`/${entityId}`, { status: "PAUSED" });
-      await send(`⏸ ${entityId} → PAUSED`);
-    } catch (e) { await send(`❌ Ошибка: ${e.message}`); }
+      await send(`⏸ ${entityId} → PAUSED`, true);
+    } catch (e) { await send(`❌ Ошибка: ${e.message}`, true); }
     return;
   }
 
-  // Enable: включи [type] [id]  OR  включи [id]
   const enableMatch = text.match(/включи\s+(?:(\w+)\s+)?(\d+)/);
   if (enableMatch) {
     const entityId = enableMatch[2];
     try {
       await mPost(`/${entityId}`, { status: "ACTIVE" });
-      await send(`▶️ ${entityId} → ACTIVE`);
-    } catch (e) { await send(`❌ Ошибка: ${e.message}`); }
+      await send(`▶️ ${entityId} → ACTIVE`, true);
+    } catch (e) { await send(`❌ Ошибка: ${e.message}`, true); }
     return;
   }
 });
