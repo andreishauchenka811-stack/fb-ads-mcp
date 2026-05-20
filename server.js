@@ -565,7 +565,21 @@ function registerTools(s) {
         },
         ...(excluded_countries && excluded_countries.length ? { excluded_geo_locations: { countries: excluded_countries } } : {}),
       };
-      const body = { name, campaign_id, status, daily_budget:Math.round(daily_budget_usd*100), optimization_goal, billing_event:"IMPRESSIONS", targeting, ...promotedObject(pid), ...(start_time&&{start_time}) };
+      const body = {
+        name, campaign_id, status,
+        daily_budget: Math.round(daily_budget_usd * 100),
+        optimization_goal,
+        billing_event: "IMPRESSIONS",
+        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+        targeting,
+        promoted_object: pid ? { pixel_id: pid, custom_event_type: "PURCHASE" } : undefined,
+        attribution_spec: [
+          { event_type: "CLICK_THROUGH", window_days: 7 },
+          { event_type: "ENGAGED_VIEW",  window_days: 1 },
+          { event_type: "VIEW_THROUGH",  window_days: 1 },
+        ],
+        ...(start_time && { start_time }),
+      };
       console.log("[create_adset] Request:", JSON.stringify({ account: accId, pixel: pid, ...body }));
       let d;
       try {
