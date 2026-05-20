@@ -539,7 +539,7 @@ function registerTools(s) {
   // CREATE ADSET
   s.tool("create_adset", "Sozdat novyy adset s polnymi nastroyki targetinga",
     {
-      name:z.string(), campaign_id:z.string(), daily_budget_usd:z.number(),
+      name:z.string(), campaign_id:z.string(), daily_budget_usd:z.number().optional().describe("Ne peredavat pri CBO kampanii — byudzhet uzhe na urovne kampanii"),
       optimization_goal:z.enum(["OFFSITE_CONVERSIONS","LINK_CLICKS","REACH","IMPRESSIONS"]).default("OFFSITE_CONVERSIONS"),
       pixel_id:z.string().optional(),
       countries:z.array(z.string()).default(["UA"]),
@@ -567,7 +567,7 @@ function registerTools(s) {
       };
       const body = {
         name, campaign_id, status,
-        daily_budget: Math.round(daily_budget_usd * 100),
+        ...(daily_budget_usd ? { daily_budget: Math.round(daily_budget_usd * 100) } : {}),
         optimization_goal,
         billing_event: "IMPRESSIONS",
         targeting,
