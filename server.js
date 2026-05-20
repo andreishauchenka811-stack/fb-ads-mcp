@@ -570,7 +570,6 @@ function registerTools(s) {
         daily_budget: Math.round(daily_budget_usd * 100),
         optimization_goal,
         billing_event: "IMPRESSIONS",
-        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
         targeting,
         ...(pid ? { promoted_object: { pixel_id: pid, custom_event_type: "PURCHASE" } } : {}),
         attribution_spec: [
