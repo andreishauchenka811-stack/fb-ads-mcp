@@ -529,7 +529,7 @@ function registerTools(s) {
     { name:z.string(), objective:z.enum(["OUTCOME_SALES","OUTCOME_LEADS","OUTCOME_TRAFFIC","OUTCOME_AWARENESS","OUTCOME_ENGAGEMENT"]).default("OUTCOME_SALES"), daily_budget_usd:z.number().optional(), status:z.enum(["ACTIVE","PAUSED"]).default("PAUSED"), account:ACCT_PARAM },
     async ({ name, objective, daily_budget_usd, status, account }) => {
       const accId = resolveAcct(account);
-      const body = { name, objective, status, special_ad_categories:[] };
+      const body = { name, objective, status, special_ad_categories:[], budget_rebalance_flag: true };
       if (daily_budget_usd) body.daily_budget = Math.round(daily_budget_usd*100);
       const d = await metaPost(`/act_${accId}/campaigns`, body);
       return { content: [{ type:"text", text:JSON.stringify({ success:true, campaign_id:d.id, name, objective, status, account_key:account||"primary" }, null, 2) }] };
