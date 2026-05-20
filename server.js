@@ -539,7 +539,7 @@ function registerTools(s) {
   // CREATE ADSET
   s.tool("create_adset", "Sozdat novyy adset s polnymi nastroyki targetinga",
     {
-      name:z.string(), campaign_id:z.string(), daily_budget_usd:z.number().optional().describe("Ne peredavat pri CBO kampanii — byudzhet uzhe na urovne kampanii"),
+      name:z.string(), campaign_id:z.string(), daily_budget_usd:z.number().optional().describe("Ne peredavat pri CBO kampanii — byudzhet uzhe na urovne kampanii"), advantage_audience:z.number().int().min(0).max(1).default(0).describe("0=ruchnoy targeting, 1=Advantage+ Audience"),
       optimization_goal:z.enum(["OFFSITE_CONVERSIONS","LINK_CLICKS","REACH","IMPRESSIONS"]).default("OFFSITE_CONVERSIONS"),
       pixel_id:z.string().optional(),
       countries:z.array(z.string()).default(["UA"]),
@@ -551,7 +551,7 @@ function registerTools(s) {
       start_time:z.string().optional().describe("ISO datetime: 2025-01-15T11:00:00+0200"),
       account:ACCT_PARAM,
     },
-    async ({ name, campaign_id, daily_budget_usd, optimization_goal, pixel_id, countries, excluded_countries, languages, age_min, age_max, genders, status, start_time, account }) => {
+    async ({ name, campaign_id, daily_budget_usd, optimization_goal, pixel_id, countries, excluded_countries, languages, age_min, age_max, genders, status, start_time, account, advantage_audience }) => {
       const accId = resolveAcct(account);
       const pid = pixel_id || resolvePix(account);
       const targeting = {
@@ -571,6 +571,7 @@ function registerTools(s) {
         optimization_goal,
         billing_event: "IMPRESSIONS",
         targeting,
+        targeting_automation: { advantage_audience: advantage_audience ?? 0 },
         ...(pid ? { promoted_object: { pixel_id: pid, custom_event_type: "PURCHASE" } } : {}),
         attribution_spec: [
           { event_type: "CLICK_THROUGH",      window_days: 7 },
