@@ -554,17 +554,16 @@ function registerTools(s) {
     async ({ name, campaign_id, daily_budget_usd, optimization_goal, pixel_id, countries, excluded_countries, languages, age_min, age_max, genders, status, start_time, account }) => {
       const accId = resolveAcct(account);
       const pid = pixel_id || resolvePix(account);
-      const geo_locations = {
-        ...(countries.includes("WORLDWIDE") ? {} : { countries }),
-        location_types: ["home", "recent"],
-        ...(excluded_countries && excluded_countries.length ? { excluded_countries } : {}),
-      };
       const targeting = {
-        age_min: age_min || 18,
-        age_max: age_max || 65,
-        genders: genders || [],
-        locales: languages || [],
-        geo_locations,
+        age_min,
+        age_max,
+        genders,
+        locales: languages,
+        geo_locations: {
+          ...(countries.includes("WORLDWIDE") ? {} : { countries }),
+          location_types: ["home", "recent"],
+        },
+        ...(excluded_countries && excluded_countries.length ? { excluded_geo_locations: { countries: excluded_countries } } : {}),
       };
       const body = { name, campaign_id, status, daily_budget:Math.round(daily_budget_usd*100), optimization_goal, billing_event:"IMPRESSIONS", targeting, ...promotedObject(pid), ...(start_time&&{start_time}) };
       console.log("[create_adset] Request:", JSON.stringify({ account: accId, pixel: pid, ...body }));
