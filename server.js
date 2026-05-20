@@ -557,7 +557,7 @@ function registerTools(s) {
       const geo_locations = {
         ...(countries.includes("WORLDWIDE") ? {} : { countries }),
         location_types: ["home", "recent"],
-        excluded_countries: excluded_countries || [],
+        ...(excluded_countries && excluded_countries.length ? { excluded_countries } : {}),
       };
       const targeting = {
         age_min: age_min || 18,
