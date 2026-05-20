@@ -19,7 +19,22 @@ const ALERT_COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3 часа между один�
 // Память алертов: alertKey -> timestamp последней отправки
 const alertSentAt = new Map();
 
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, { polling: false });
+
+// Сначала сбрасываем webhook и ждём — иначе при деплое два процесса
+// дерутся за polling и получаем 409 Conflict
+bot.deleteWebhook({ drop_pending_updates: true })
+  .then(() => bot.startPolling({ restart: false }))
+  .catch((e) => console.error("[TG] Init error:", e.message));
+
+bot.on("polling_error", (e) => {
+  // 409 = старый процесс ещё жив, просто ждём
+  if (e.code === "ETELEGRAM" && e.message.includes("409")) {
+    console.warn("[TG] 409 Conflict — ждём завершения старого процесса...");
+  } else {
+    console.error("[TG] Polling error:", e.message);
+  }
+});
 
 // -- Meta helpers -----------------------------------------------------------
 

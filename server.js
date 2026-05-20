@@ -560,7 +560,14 @@ function registerTools(s) {
       if (languages.length) targeting.locales = languages;
       if (genders.length) targeting.genders = genders;
       const body = { name, campaign_id, status, daily_budget:Math.round(daily_budget_usd*100), optimization_goal, billing_event:"IMPRESSIONS", targeting, ...promotedObject(pid), ...(start_time&&{start_time}) };
-      const d = await metaPost(`/act_${accId}/adsets`, body);
+      console.log("[create_adset] Request:", JSON.stringify({ account: accId, pixel: pid, ...body }));
+      let d;
+      try {
+        d = await metaPost(`/act_${accId}/adsets`, body);
+      } catch(e) {
+        console.error("[create_adset] FAILED. Body sent:", JSON.stringify(body));
+        throw e;
+      }
       return { content: [{ type:"text", text:JSON.stringify({ success:true, adset_id:d.id, name, campaign_id, budget:`$${daily_budget_usd}`, countries, status }, null, 2) }] };
     }
   );
